@@ -2,7 +2,10 @@
 const Notification = require("../models/Notification");
 const User = require("../models/User");
 const Recruiter = require("../models/Recruiter");
-const { sendBulkEmail } = require("../utils/mailer");
+const { sendBulkEmail, isValidDeliverableEmail } = require("../utils/mailer");
+
+const APP_NAME = process.env.APP_NAME || "Smile Jobs";
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 
 // ═══════════════════════════════════════════════════════════════
 // HELPER: Resolve target users based on audience and filters
@@ -25,7 +28,6 @@ const resolveTargetUsers = async (targetAudience, filters = {}, targetUserIds = 
     return { candidates, recruiters };
   }
 
-  // Build filter for candidates
   const candidateFilter = { isActive: { $ne: false } };
   if (filters.city) candidateFilter.city = { $regex: filters.city, $options: "i" };
   if (filters.state) candidateFilter.state = { $regex: filters.state, $options: "i" };
@@ -44,16 +46,14 @@ const resolveTargetUsers = async (targetAudience, filters = {}, targetUserIds = 
   }
 
   if (targetAudience === "all" || targetAudience === "recruiters") {
-    recruiters = await Recruiter.find(recruiterFilter).select(
-      "name email mobileNumber"
-    );
+    recruiters = await Recruiter.find(recruiterFilter).select("name email mobileNumber");
   }
 
   return { candidates, recruiters };
 };
 
 // ═══════════════════════════════════════════════════════════════
-// @desc    Get all notifications (admin panel — with filters)
+// @desc    Get all notifications
 // @route   GET /api/v1/notifications
 // ═══════════════════════════════════════════════════════════════
 const getNotifications = async (req, res) => {
@@ -73,8 +73,7 @@ const getNotifications = async (req, res) => {
 
     if (status && status !== "all") filter.status = status;
     if (type && type !== "all") filter.type = type;
-    if (targetAudience && targetAudience !== "all")
-      filter.targetAudience = targetAudience;
+    if (targetAudience && targetAudience !== "all") filter.targetAudience = targetAudience;
 
     if (search) {
       filter.$or = [
@@ -84,33 +83,29 @@ const getNotifications = async (req, res) => {
       ];
     }
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
     const sortObj = { [sortBy]: sortOrder === "asc" ? 1 : -1 };
 
     const [notifications, total] = await Promise.all([
-      Notification.find(filter)
-        .sort(sortObj)
-        .skip(skip)
-        .limit(parseInt(limit)),
+      Notification.find(filter).sort(sortObj).skip(skip).limit(parseInt(limit, 10)),
       Notification.countDocuments(filter),
     ]);
 
-    const [draftCount, sentCount, scheduledCount, failedCount] =
-      await Promise.all([
-        Notification.countDocuments({ status: "draft" }),
-        Notification.countDocuments({ status: "sent" }),
-        Notification.countDocuments({ status: "scheduled" }),
-        Notification.countDocuments({ status: "failed" }),
-      ]);
+    const [draftCount, sentCount, scheduledCount, failedCount] = await Promise.all([
+      Notification.countDocuments({ status: "draft" }),
+      Notification.countDocuments({ status: "sent" }),
+      Notification.countDocuments({ status: "scheduled" }),
+      Notification.countDocuments({ status: "failed" }),
+    ]);
 
     res.status(200).json({
       success: true,
       data: notifications,
       pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
+        page: parseInt(page, 10),
+        limit: parseInt(limit, 10),
         total,
-        pages: Math.ceil(total / parseInt(limit)),
+        pages: Math.ceil(total / parseInt(limit, 10)),
       },
       counts: {
         draft: draftCount,
@@ -137,48 +132,30 @@ const getNotificationById = async (req, res) => {
   try {
     const notification = await Notification.findById(req.params.id);
     if (!notification) {
-      return res.status(404).json({
-        success: false,
-        message: "Notification not found",
-      });
+      return res.status(404).json({ success: false, message: "Notification not found" });
     }
 
-    res.status(200).json({
-      success: true,
-      data: notification,
-    });
+    res.status(200).json({ success: true, data: notification });
   } catch (error) {
     console.error("Get Notification Error:", error.message);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching notification",
-    });
+    res.status(500).json({ success: false, message: "Server error while fetching notification" });
   }
 };
 
 // ═══════════════════════════════════════════════════════════════
-// @desc    📱 MOBILE APP: Fetch notifications for logged-in user
+// @desc    MOBILE APP: Fetch notifications for logged-in user
 // @route   GET /api/v1/notifications/user/my-notifications
-//          Mobile app calls this to get its notifications from DB
 // ═══════════════════════════════════════════════════════════════
 const getMyNotifications = async (req, res) => {
   try {
     const userId = req.authUser?.id || req.authUser?.userId;
     const userRole = req.authUser?.role || "user";
-    const { page = 1, limit = 20, unreadOnly } = req.query;
+    const { page = 1, limit = 20 } = req.query;
 
     if (!userId) {
-      return res.status(401).json({
-        success: false,
-        message: "User not authenticated",
-      });
+      return res.status(401).json({ success: false, message: "User not authenticated" });
     }
 
-    // Build query: notification is for this user if:
-    // 1. targetAudience is "all"
-    // 2. targetAudience is "candidates" and user is a candidate
-    // 3. targetAudience is "recruiters" and user is a recruiter
-    // 4. targetAudience is "specific" and userId is in targetUserIds
     const audienceConditions = [{ targetAudience: "all" }];
 
     if (userRole === "job_seeker" || userRole === "user" || userRole === "candidate") {
@@ -199,13 +176,13 @@ const getMyNotifications = async (req, res) => {
       $or: audienceConditions,
     };
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
 
     const [notifications, total] = await Promise.all([
       Notification.find(filter)
         .sort({ createdAt: -1 })
         .skip(skip)
-        .limit(parseInt(limit))
+        .limit(parseInt(limit, 10))
         .select("title body imageUrl type actionUrl sentAt createdAt"),
       Notification.countDocuments(filter),
     ]);
@@ -214,10 +191,10 @@ const getMyNotifications = async (req, res) => {
       success: true,
       data: notifications,
       pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
+        page: parseInt(page, 10),
+        limit: parseInt(limit, 10),
         total,
-        pages: Math.ceil(total / parseInt(limit)),
+        pages: Math.ceil(total / parseInt(limit, 10)),
       },
     });
   } catch (error) {
@@ -230,7 +207,7 @@ const getMyNotifications = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// @desc    📱 MOBILE APP: Get unread notification count
+// @desc    MOBILE APP: Get unread notification count
 // @route   GET /api/v1/notifications/user/unread-count
 // ═══════════════════════════════════════════════════════════════
 const getUnreadCount = async (req, res) => {
@@ -239,10 +216,7 @@ const getUnreadCount = async (req, res) => {
     const userRole = req.authUser?.role || "user";
 
     if (!userId) {
-      return res.status(401).json({
-        success: false,
-        message: "User not authenticated",
-      });
+      return res.status(401).json({ success: false, message: "User not authenticated" });
     }
 
     const audienceConditions = [{ targetAudience: "all" }];
@@ -264,28 +238,22 @@ const getUnreadCount = async (req, res) => {
       $or: audienceConditions,
     });
 
-    res.status(200).json({
-      success: true,
-      data: { count },
-    });
+    res.status(200).json({ success: true, data: { count } });
   } catch (error) {
     console.error("Get Unread Count Error:", error.message);
-    res.status(500).json({
-      success: false,
-      message: "Server error",
-    });
+    res.status(500).json({ success: false, message: "Server error" });
   }
 };
 
 // ═══════════════════════════════════════════════════════════════
-// @desc    Send notification (save to DB + optional email)
+// @desc    Send notification (save to DB + optional email via Brevo)
 // @route   POST /api/v1/notifications/send
 // ═══════════════════════════════════════════════════════════════
 const sendNotification = async (req, res) => {
   try {
-    const adminId = req.authUser.id || req.authUser.adminId;
-    const adminName = req.authUser.name || "Admin";
-    const adminEmail = req.authUser.email || "";
+    const adminId = req.authUser?.id || req.authUser?.adminId;
+    const adminName = req.authUser?.name || "Admin";
+    const adminEmail = req.authUser?.email || "";
 
     const {
       title,
@@ -307,7 +275,6 @@ const sendNotification = async (req, res) => {
       });
     }
 
-    // Resolve target users count
     const { candidates, recruiters } = await resolveTargetUsers(
       targetAudience,
       filters,
@@ -316,8 +283,6 @@ const sendNotification = async (req, res) => {
 
     const totalTargeted = candidates.length + recruiters.length;
 
-    // Create notification record in DB
-    // Mobile app will fetch this from DB
     const notification = await Notification.create({
       sentBy: { adminId, adminName, adminEmail },
       title,
@@ -335,30 +300,25 @@ const sendNotification = async (req, res) => {
       stats: {
         totalTargeted,
         inAppDelivered: channels.inApp ? totalTargeted : 0,
+        emailSent: 0,
+        emailFailed: 0,
       },
     });
 
-    // If scheduled for later, don't send email now
     if (scheduledAt) {
       return res.status(201).json({
         success: true,
-        message: `Notification scheduled for ${new Date(scheduledAt).toLocaleString()}. It will appear in the app at that time.`,
+        message: `Notification scheduled for ${new Date(scheduledAt).toLocaleString()}.`,
         data: notification,
       });
     }
 
-    // ── EMAIL (optional) ──
+    // ── SEND VIA BREVO SMTP ──
     if (channels.email) {
       const allUsers = [
-        ...candidates.map((u) => ({
-          email: u.email,
-          name: u.name,
-        })),
-        ...recruiters.map((r) => ({
-          email: r.email,
-          name: r.name,
-        })),
-      ].filter((u) => u.email && u.email.length > 0);
+        ...candidates.map((u) => ({ email: u.email, name: u.name })),
+        ...recruiters.map((r) => ({ email: r.email, name: r.name })),
+      ].filter((u) => isValidDeliverableEmail(u.email));
 
       if (allUsers.length > 0) {
         const emailHtml = `
@@ -374,7 +334,7 @@ const sendNotification = async (req, res) => {
               .content { padding: 30px; }
               .content h2 { color: #1a1a2e; font-size: 20px; margin-bottom: 15px; }
               .content p { color: #4a4a6a; font-size: 15px; line-height: 1.6; }
-              ${imageUrl ? '.hero-img { width: 100%; max-height: 300px; object-fit: cover; }' : ''}
+              ${imageUrl ? ".hero-img { width: 100%; max-height: 300px; object-fit: cover; }" : ""}
               .cta-btn { display: inline-block; background: #4F46E5; color: #ffffff; padding: 12px 30px; border-radius: 8px; text-decoration: none; font-weight: 600; margin-top: 20px; }
               .footer { background: #f8f9fa; padding: 20px; text-align: center; font-size: 12px; color: #888; }
             </style>
@@ -382,29 +342,26 @@ const sendNotification = async (req, res) => {
           <body>
             <div class="container">
               <div class="header">
-                <h1>CareerFlow</h1>
+                <h1>${APP_NAME}</h1>
               </div>
-              ${imageUrl ? `<img src="${imageUrl}" alt="notification" class="hero-img" />` : ''}
+              ${imageUrl ? `<img src="${imageUrl}" alt="notification" class="hero-img" />` : ""}
               <div class="content">
                 <h2>${title}</h2>
                 <p>Hi {{name}},</p>
                 <p>${body}</p>
-                ${actionUrl ? `<a href="${actionUrl}" class="cta-btn">Take Action</a>` : ''}
+                ${actionUrl ? `<a href="${actionUrl}" class="cta-btn">Take Action</a>` : ""}
               </div>
               <div class="footer">
-                <p>You received this because you're a CareerFlow user.</p>
+                <p>You received this because you're a registered ${APP_NAME} user.</p>
                 <p><a href="{{unsubscribeLink}}">Unsubscribe</a></p>
+                <p>© ${new Date().getFullYear()} ${APP_NAME}. All rights reserved.</p>
               </div>
             </div>
           </body>
           </html>
         `;
 
-        const emailResult = await sendBulkEmail(
-          allUsers,
-          `CareerFlow: ${title}`,
-          emailHtml
-        );
+        const emailResult = await sendBulkEmail(allUsers, `${APP_NAME}: ${title}`, emailHtml);
 
         notification.stats.emailSent = emailResult.sent;
         notification.stats.emailFailed = emailResult.failed;
@@ -423,7 +380,9 @@ const sendNotification = async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: `Notification saved to database for ${totalTargeted} user(s). Mobile app will fetch it automatically.${channels.email ? ` Email sent to ${notification.stats.emailSent} user(s).` : ''}`,
+      message: `Notification dispatched for ${totalTargeted} user(s).${
+        channels.email ? ` Sent ${notification.stats.emailSent} email(s).` : ""
+      }`,
       data: notification,
     });
   } catch (error) {
@@ -436,7 +395,7 @@ const sendNotification = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// @desc    Get target audience count (preview before sending)
+// @desc    Preview target audience count
 // @route   POST /api/v1/notifications/preview-count
 // ═══════════════════════════════════════════════════════════════
 const getTargetCount = async (req, res) => {
@@ -451,8 +410,8 @@ const getTargetCount = async (req, res) => {
 
     const candidateCount = candidates.length;
     const recruiterCount = recruiters.length;
-    const withEmail = [...candidates, ...recruiters].filter(
-      (u) => u.email && u.email.length > 0
+    const withEmail = [...candidates, ...recruiters].filter((u) =>
+      isValidDeliverableEmail(u.email)
     ).length;
 
     res.status(200).json({
@@ -481,36 +440,25 @@ const deleteNotification = async (req, res) => {
   try {
     const notification = await Notification.findByIdAndDelete(req.params.id);
     if (!notification) {
-      return res.status(404).json({
-        success: false,
-        message: "Notification not found",
-      });
+      return res.status(404).json({ success: false, message: "Notification not found" });
     }
 
-    res.status(200).json({
-      success: true,
-      message: "Notification deleted successfully",
-    });
+    res.status(200).json({ success: true, message: "Notification deleted successfully" });
   } catch (error) {
     console.error("Delete Notification Error:", error.message);
-    res.status(500).json({
-      success: false,
-      message: "Server error while deleting notification",
-    });
+    res.status(500).json({ success: false, message: "Server error while deleting notification" });
   }
 };
 
 // ═══════════════════════════════════════════════════════════════
-// @desc    Cancel a scheduled notification
+// @desc    Cancel scheduled notification
 // @route   PATCH /api/v1/notifications/:id/cancel
 // ═══════════════════════════════════════════════════════════════
 const cancelNotification = async (req, res) => {
   try {
     const notification = await Notification.findById(req.params.id);
     if (!notification) {
-      return res
-        .status(404)
-        .json({ success: false, message: "Notification not found" });
+      return res.status(404).json({ success: false, message: "Notification not found" });
     }
     if (notification.status !== "scheduled" && notification.status !== "draft") {
       return res.status(400).json({
@@ -522,17 +470,10 @@ const cancelNotification = async (req, res) => {
     notification.status = "cancelled";
     await notification.save();
 
-    res.status(200).json({
-      success: true,
-      message: "Notification cancelled",
-      data: notification,
-    });
+    res.status(200).json({ success: true, message: "Notification cancelled", data: notification });
   } catch (error) {
     console.error("Cancel Notification Error:", error.message);
-    res.status(500).json({
-      success: false,
-      message: "Server error while cancelling notification",
-    });
+    res.status(500).json({ success: false, message: "Server error while cancelling notification" });
   }
 };
 

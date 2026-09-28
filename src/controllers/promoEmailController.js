@@ -4,6 +4,9 @@ const User = require("../models/User");
 const Recruiter = require("../models/Recruiter");
 const { sendBulkEmail, verifyConnection } = require("../utils/mailer");
 
+const APP_NAME = process.env.APP_NAME || "Smile Jobs";
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+
 // ═══════════════════════════════════════════════════════════════
 // @desc    Get all promotional email campaigns
 // @route   GET /api/v1/promotional-emails
@@ -220,9 +223,15 @@ const sendCampaign = async (req, res) => {
 
       // Apply filters
       if (campaign.filters?.city)
-        userFilter.city = { $regex: campaign.filters.city, $options: "i" };
+        userFilter.city = {
+          $regex: campaign.filters.city,
+          $options: "i",
+        };
       if (campaign.filters?.state)
-        userFilter.state = { $regex: campaign.filters.state, $options: "i" };
+        userFilter.state = {
+          $regex: campaign.filters.state,
+          $options: "i",
+        };
       if (campaign.filters?.experienceLevel)
         userFilter.experienceLevel = campaign.filters.experienceLevel;
       if (campaign.filters?.industry)
@@ -230,7 +239,10 @@ const sendCampaign = async (req, res) => {
           $regex: campaign.filters.industry,
           $options: "i",
         };
-      if (campaign.filters?.skills && campaign.filters.skills.length > 0) {
+      if (
+        campaign.filters?.skills &&
+        campaign.filters.skills.length > 0
+      ) {
         userFilter.skills = { $in: campaign.filters.skills };
       }
       if (campaign.filters?.registeredAfter) {
@@ -304,7 +316,7 @@ const sendCampaign = async (req, res) => {
     campaign.stats.totalRecipients = recipients.length;
     await campaign.save();
 
-    // Send emails
+    // Send emails via Brevo SMTP
     const result = await sendBulkEmail(
       recipients,
       campaign.subject,
@@ -340,7 +352,9 @@ const sendCampaign = async (req, res) => {
       await PromotionalEmail.findByIdAndUpdate(req.params.id, {
         status: "failed",
       });
-    } catch {}
+    } catch (updateErr) {
+      console.error("Failed to update campaign status:", updateErr.message);
+    }
 
     res.status(500).json({
       success: false,
@@ -491,7 +505,7 @@ const deleteCampaign = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// @desc    Verify SMTP connection health
+// @desc    Verify SMTP connection health (Brevo)
 // @route   GET /api/v1/promotional-emails/smtp-health
 // ═══════════════════════════════════════════════════════════════
 const checkSmtpHealth = async (req, res) => {
@@ -501,11 +515,14 @@ const checkSmtpHealth = async (req, res) => {
       success: true,
       data: {
         connected: result.success,
-        host: process.env.EMAIL_HOST || "smtp.gmail.com",
+        provider: "Brevo (Sendinblue)",
+        host: process.env.EMAIL_HOST || "smtp-relay.brevo.com",
         port: process.env.EMAIL_PORT || "587",
         user: process.env.EMAIL_USER
           ? `${process.env.EMAIL_USER.slice(0, 3)}***`
           : "not configured",
+        fromAddress: process.env.EMAIL_FROM_ADDRESS || "not configured",
+        fromName: process.env.EMAIL_FROM_NAME || "not configured",
         error: result.error || null,
       },
     });
@@ -527,7 +544,7 @@ const getTemplates = async (req, res) => {
       id: "welcome",
       name: "Welcome Email",
       type: "promotion",
-      subject: "Welcome to CareerFlow! 🚀",
+      subject: `Welcome to ${APP_NAME}! 🚀`,
       previewText: "Your career journey starts here",
       htmlContent: `
 <!DOCTYPE html>
@@ -545,15 +562,15 @@ body{font-family:'Segoe UI',sans-serif;margin:0;padding:0;background:#f0f2f5}
 .ft{background:#f9fafb;padding:20px;text-align:center;font-size:12px;color:#9ca3af}
 </style></head>
 <body><div class="wrap">
-<div class="hdr"><h1>Welcome to CareerFlow!</h1><p>Your career journey starts now</p></div>
+<div class="hdr"><h1>Welcome to ${APP_NAME}!</h1><p>Your career journey starts now</p></div>
 <div class="body">
 <h2>Hi {{name}},</h2>
-<p>Thank you for joining CareerFlow! We're excited to help you find your dream job or the perfect candidate.</p>
+<p>Thank you for joining ${APP_NAME}! We're excited to help you find your dream job or the perfect candidate.</p>
 <p>Here's what you can do next:</p>
 <ul><li>Complete your profile</li><li>Browse thousands of jobs</li><li>Apply with one tap</li></ul>
-<a href="https://careerflow.app" class="btn">Explore Jobs →</a>
+<a href="${FRONTEND_URL}" class="btn">Explore Jobs →</a>
 </div>
-<div class="ft"><p>CareerFlow Inc. | <a href="{{unsubscribeLink}}">Unsubscribe</a></p></div>
+<div class="ft"><p>${APP_NAME} | <a href="{{unsubscribeLink}}">Unsubscribe</a></p></div>
 </div></body></html>`,
     },
     {
@@ -587,9 +604,9 @@ body{font-family:'Segoe UI',sans-serif;margin:0;padding:0;background:#f0f2f5}
 <div class="job-card"><h3>Software Engineer</h3><p>TechCorp • Bangalore • ₹12-18 LPA</p></div>
 <div class="job-card"><h3>Product Manager</h3><p>StartupX • Remote • ₹18-25 LPA</p></div>
 <div class="job-card"><h3>Data Analyst</h3><p>DataCo • Mumbai • ₹8-12 LPA</p></div>
-<a href="https://careerflow.app/jobs" class="btn">View All Jobs →</a>
+<a href="${FRONTEND_URL}/jobs" class="btn">View All Jobs →</a>
 </div>
-<div class="ft"><p>CareerFlow Inc. | <a href="{{unsubscribeLink}}">Unsubscribe</a></p></div>
+<div class="ft"><p>${APP_NAME} | <a href="{{unsubscribeLink}}">Unsubscribe</a></p></div>
 </div></body></html>`,
     },
     {
@@ -597,7 +614,7 @@ body{font-family:'Segoe UI',sans-serif;margin:0;padding:0;background:#f0f2f5}
       name: "Premium Upgrade",
       type: "promotion",
       subject: "⭐ Unlock Premium Features — 50% Off!",
-      previewText: "Limited time offer on CareerFlow Premium",
+      previewText: `Limited time offer on ${APP_NAME} Premium`,
       htmlContent: `
 <!DOCTYPE html>
 <html>
@@ -619,15 +636,15 @@ body{font-family:'Segoe UI',sans-serif;margin:0;padding:0;background:#f0f2f5}
 <div class="hdr"><h1>⭐ Go Premium</h1><div class="badge">50% OFF — Limited Time</div></div>
 <div class="body">
 <h2>Hi {{name}},</h2>
-<p>Upgrade to CareerFlow Premium and unlock exclusive features:</p>
+<p>Upgrade to ${APP_NAME} Premium and unlock exclusive features:</p>
 <div class="feature"><span class="check">✓</span> Priority job applications</div>
 <div class="feature"><span class="check">✓</span> Direct HR contact access</div>
 <div class="feature"><span class="check">✓</span> Resume boost in search results</div>
 <div class="feature"><span class="check">✓</span> Unlimited job alerts</div>
 <div class="feature"><span class="check">✓</span> Interview preparation tools</div>
-<a href="https://careerflow.app/premium" class="btn">Upgrade Now — 50% Off →</a>
+<a href="${FRONTEND_URL}/premium" class="btn">Upgrade Now — 50% Off →</a>
 </div>
-<div class="ft"><p>CareerFlow Inc. | <a href="{{unsubscribeLink}}">Unsubscribe</a></p></div>
+<div class="ft"><p>${APP_NAME} | <a href="{{unsubscribeLink}}">Unsubscribe</a></p></div>
 </div></body></html>`,
     },
     {
@@ -656,9 +673,9 @@ body{font-family:'Segoe UI',sans-serif;margin:0;padding:0;background:#f0f2f5}
 <h2>Hi {{name}},</h2>
 <p>We're thrilled to announce our brand new <strong>AI Resume Builder</strong>!</p>
 <p>Create a professional, ATS-friendly resume in minutes with AI-powered suggestions tailored to your industry and experience.</p>
-<a href="https://careerflow.app/resume-builder" class="btn">Try AI Resume Builder →</a>
+<a href="${FRONTEND_URL}/resume-builder" class="btn">Try AI Resume Builder →</a>
 </div>
-<div class="ft"><p>CareerFlow Inc. | <a href="{{unsubscribeLink}}">Unsubscribe</a></p></div>
+<div class="ft"><p>${APP_NAME} | <a href="{{unsubscribeLink}}">Unsubscribe</a></p></div>
 </div></body></html>`,
     },
   ];

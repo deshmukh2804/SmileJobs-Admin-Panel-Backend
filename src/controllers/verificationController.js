@@ -37,6 +37,9 @@ const DOC_TYPE_LABELS = {
   other: "Other Document",
 };
 
+const APP_NAME = process.env.APP_NAME || "Smile Jobs";
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+
 // ─── EMAIL TEMPLATES ──────────────────────────────────────────
 const buildApprovalEmail = (recruiterName, companyName) => `
 <div style="font-family:'Segoe UI',Arial,sans-serif;max-width:600px;margin:0 auto;background:#f8fafc;padding:20px;">
@@ -57,10 +60,14 @@ const buildApprovalEmail = (recruiterName, companyName) => `
       <p style="color:#166534;margin:6px 0 0;font-size:14px;font-weight:600;">✓ Increased candidate trust</p>
       <p style="color:#166534;margin:6px 0 0;font-size:14px;font-weight:600;">✓ Priority listing in search</p>
     </div>
+    <div style="text-align:center;margin:24px 0;">
+      <a href="${FRONTEND_URL}/recruiter/dashboard" style="display:inline-block;background:linear-gradient(135deg,#5F8A72,#4a6f5b);color:#fff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;">Go to Dashboard →</a>
+    </div>
     <p style="color:#64748b;font-size:13px;line-height:1.6;margin:24px 0 0;">
-      — CareerFlow Compliance Team
+      — ${APP_NAME} Compliance Team
     </p>
   </div>
+  <p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:16px;">© ${new Date().getFullYear()} ${APP_NAME}. All rights reserved.</p>
 </div>`;
 
 const buildRejectionEmail = (recruiterName, companyName, reason) => `
@@ -80,10 +87,14 @@ const buildRejectionEmail = (recruiterName, companyName, reason) => `
     <p style="color:#334155;font-size:14px;line-height:1.6;margin:20px 0;">
       You can re-submit your verification with the correct documents from your recruiter dashboard.
     </p>
+    <div style="text-align:center;margin:24px 0;">
+      <a href="${FRONTEND_URL}/recruiter/verification" style="display:inline-block;background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;">Re-submit Verification →</a>
+    </div>
     <p style="color:#64748b;font-size:13px;line-height:1.6;margin:24px 0 0;">
-      — CareerFlow Compliance Team
+      — ${APP_NAME} Compliance Team
     </p>
   </div>
+  <p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:16px;">© ${new Date().getFullYear()} ${APP_NAME}. All rights reserved.</p>
 </div>`;
 
 const buildClarificationEmail = (recruiterName, companyName, message, docs) => `
@@ -113,15 +124,20 @@ const buildClarificationEmail = (recruiterName, companyName, message, docs) => `
     <p style="color:#334155;font-size:14px;line-height:1.6;margin:20px 0;">
       Please log into your recruiter dashboard and re-upload the requested documents to complete verification.
     </p>
+    <div style="text-align:center;margin:24px 0;">
+      <a href="${FRONTEND_URL}/recruiter/verification" style="display:inline-block;background:linear-gradient(135deg,#d97706,#b45309);color:#fff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;">Upload Documents →</a>
+    </div>
     <p style="color:#64748b;font-size:13px;line-height:1.6;margin:24px 0 0;">
-      — CareerFlow Compliance Team
+      — ${APP_NAME} Compliance Team
     </p>
   </div>
+  <p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:16px;">© ${new Date().getFullYear()} ${APP_NAME}. All rights reserved.</p>
 </div>`;
 
 // ─── DATA TRANSFORMERS ────────────────────────────────────────
 const transformToListItem = (v) => {
-  const companyName = v.companyName || v.companySnapshot?.name || "Unnamed Company";
+  const companyName =
+    v.companyName || v.companySnapshot?.name || "Unnamed Company";
   const submittedAt = v.submittedAt || v.createdAt;
 
   return {
@@ -170,7 +186,10 @@ const getVerifications = async (req, res) => {
     if (status && status !== "all") filter.status = status;
 
     if (search && search.trim()) {
-      const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      const regex = new RegExp(
+        search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        "i"
+      );
       filter.$or = [
         { companyName: regex },
         { recruiterName: regex },
@@ -186,7 +205,11 @@ const getVerifications = async (req, res) => {
       sort === "newest" ? { submittedAt: -1 } : { submittedAt: 1 };
 
     const [items, total, counts] = await Promise.all([
-      Verification.find(filter).sort(sortObj).skip(skip).limit(limitNum).lean(),
+      Verification.find(filter)
+        .sort(sortObj)
+        .skip(skip)
+        .limit(limitNum)
+        .lean(),
       Verification.countDocuments(filter),
       Verification.aggregate([
         { $group: { _id: "$status", count: { $sum: 1 } } },
@@ -242,10 +265,15 @@ const getVerificationById = async (req, res) => {
     // Fetch full recruiter profile from recruiter_db
     let recruiter = null;
     if (verification.recruiterId) {
-      recruiter = await RecruiterProfile.findById(verification.recruiterId).lean();
+      recruiter = await RecruiterProfile.findById(
+        verification.recruiterId
+      ).lean();
     }
 
-    const companyName = verification.companyName || verification.companySnapshot?.name || "Unnamed";
+    const companyName =
+      verification.companyName ||
+      verification.companySnapshot?.name ||
+      "Unnamed";
     const submittedAt = verification.submittedAt || verification.createdAt;
 
     const detail = {
@@ -318,7 +346,9 @@ const getVerificationById = async (req, res) => {
 
       // Recruiter info
       recruiter: {
-        id: verification.recruiterId ? String(verification.recruiterId) : null,
+        id: verification.recruiterId
+          ? String(verification.recruiterId)
+          : null,
         name: verification.recruiterName || recruiter?.name || "",
         email: verification.recruiterEmail || recruiter?.email || "",
         avatar: recruiter?.avatar?.url || "",
@@ -411,12 +441,12 @@ const approveVerification = async (req, res) => {
       );
     }
 
-    // Email recruiter
+    // Email recruiter via Brevo SMTP
     if (verification.recruiterEmail) {
       try {
         await sendEmail({
           to: verification.recruiterEmail,
-          subject: `✓ ${verification.companyName} — Verification Approved`,
+          subject: `✓ ${verification.companyName} — Verification Approved | ${APP_NAME}`,
           html: buildApprovalEmail(
             verification.recruiterName || "there",
             verification.companyName
@@ -496,12 +526,12 @@ const rejectVerification = async (req, res) => {
       });
     }
 
-    // Email recruiter
+    // Email recruiter via Brevo SMTP
     if (verification.recruiterEmail) {
       try {
         await sendEmail({
           to: verification.recruiterEmail,
-          subject: `Verification Update — ${verification.companyName}`,
+          subject: `Verification Update — ${verification.companyName} | ${APP_NAME}`,
           html: buildRejectionEmail(
             verification.recruiterName || "there",
             verification.companyName,
@@ -580,12 +610,12 @@ const requestClarification = async (req, res) => {
       });
     }
 
-    // Email recruiter
+    // Email recruiter via Brevo SMTP
     if (verification.recruiterEmail) {
       try {
         await sendEmail({
           to: verification.recruiterEmail,
-          subject: `Action Required — Re-upload Documents for ${verification.companyName}`,
+          subject: `Action Required — Re-upload Documents for ${verification.companyName} | ${APP_NAME}`,
           html: buildClarificationEmail(
             verification.recruiterName || "there",
             verification.companyName,
@@ -659,7 +689,9 @@ const getStats = async (req, res) => {
         submittedToday: todayCount,
         approvedThisWeek: weekApproved,
         totalPending:
-          stats.pending + stats.under_review + stats.clarification_requested,
+          stats.pending +
+          stats.under_review +
+          stats.clarification_requested,
       },
     });
   } catch (error) {
