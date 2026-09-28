@@ -33,7 +33,8 @@ const app = express();
 // ═══════════════════════════════════════════════════════════════
 app.use(
   helmet({
-    contentSecurityPolicy: false,
+    contentSecurityPolicy: false, // Disables CSP header blockages
+    frameguard: false,            // ⚡ IMPORTANT: Disables X-Frame-Options SAMEORIGIN so iframe can load
     crossOriginResourcePolicy: { policy: "cross-origin" },
   })
 );

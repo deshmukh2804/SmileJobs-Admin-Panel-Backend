@@ -484,7 +484,6 @@ const getVerificationById = async (req, res) => {
           "",
       },
 
-      // Documents — with proxy URL for PDFs to bypass Cloudinary ACL block
       documents: (verification.documents || []).map((d) => {
         const detectedFormat = (d.format || "").toLowerCase();
         const finalFormat =
@@ -497,7 +496,7 @@ const getVerificationById = async (req, res) => {
           finalFormat
         );
 
-        // ⚡ For PDFs, route through our backend proxy to bypass Cloudinary 401 error
+        // Point to our secure backend proxy route
         const viewableUrl = isPdf
           ? `${BACKEND_URL}/api/v1/verifications/${verification._id}/documents/${d._id}/proxy`
           : d.url;
@@ -539,12 +538,15 @@ const getVerificationById = async (req, res) => {
 
 /**
  * GET /api/v1/verifications/:id/documents/:docId/proxy
- * ⚡ PDF Proxy — Fetches PDFs from Cloudinary using signed authentication,
- * then streams them to the admin browser. Bypasses CORS & Cloudinary 401 ACL errors.
+ * Optimized PDF Proxy specifically supporting private, authenticated, and public Cloudinary assets.
  */
 const proxyDocument = async (req, res) => {
   try {
     const { id, docId } = req.params;
+
+    // Remove frameguard headers on this endpoint to allow loading inside frontend iframes
+    res.removeHeader("X-Frame-Options");
+    res.removeHeader("Content-Security-Policy");
 
     const verification = await Verification.findById(id).lean();
     if (!verification) {
@@ -566,34 +568,46 @@ const proxyDocument = async (req, res) => {
     const publicId = doc.public_id;
     const format = (doc.format || "pdf").toLowerCase();
 
-    // ⚡ Try multiple Cloudinary URL strategies for robust delivery
+    // Generate signed URLs using both "authenticated" and "private" types
+    const authenticatedUrl = cloudinary.url(publicId, {
+      resource_type: "image",
+      type: "authenticated",
+      format,
+      sign_url: true,
+      secure: true,
+    });
+
+    const privateUrl = cloudinary.url(publicId, {
+      resource_type: "image",
+      type: "private",
+      format,
+      sign_url: true,
+      secure: true,
+    });
+
+    const publicSignedUrl = cloudinary.url(publicId, {
+      resource_type: "image",
+      type: "upload",
+      format,
+      sign_url: true,
+      secure: true,
+    });
+
+    const rawSignedUrl = cloudinary.url(publicId, {
+      resource_type: "raw",
+      type: "upload",
+      format,
+      sign_url: true,
+      secure: true,
+    });
+
+    // Strategy pool prioritizes authenticated, then private, then public signed formats
     const attempts = [
-      // Strategy 1: Signed URL with authenticated type (secure)
-      cloudinary.url(publicId, {
-        resource_type: "image",
-        type: "authenticated",
-        format,
-        sign_url: true,
-        secure: true,
-      }),
-      // Strategy 2: Signed URL with upload type
-      cloudinary.url(publicId, {
-        resource_type: "image",
-        type: "upload",
-        format,
-        sign_url: true,
-        secure: true,
-      }),
-      // Strategy 3: Raw resource type
-      cloudinary.url(publicId, {
-        resource_type: "raw",
-        type: "upload",
-        format,
-        sign_url: true,
-        secure: true,
-      }),
-      // Strategy 4: Original stored URL as final fallback
-      doc.url,
+      authenticatedUrl,
+      privateUrl,
+      publicSignedUrl,
+      rawSignedUrl,
+      doc.url, // final fallback
     ];
 
     let fetchedResponse = null;
@@ -603,7 +617,7 @@ const proxyDocument = async (req, res) => {
       try {
         const response = await axios.get(attemptUrl, {
           responseType: "arraybuffer",
-          timeout: 20000,
+          timeout: 10000,
           validateStatus: (s) => s >= 200 && s < 300,
         });
         if (response.data && response.data.byteLength > 0) {
@@ -617,20 +631,17 @@ const proxyDocument = async (req, res) => {
     }
 
     if (!fetchedResponse) {
-      console.error(`❌ PDF Proxy failed for doc ${docId}:`, lastError);
+      console.error(`❌ PDF Proxy retrieval failed for doc ${docId}:`, lastError);
       return res.status(502).json({
         success: false,
-        message: "Failed to fetch document from storage",
+        message: "Failed to fetch document from secure storage",
         error: lastError,
       });
     }
 
-    // Determine content type
     const contentType =
-      fetchedResponse.headers["content-type"] ||
-      (format === "pdf" ? "application/pdf" : "application/octet-stream");
+      fetchedResponse.headers["content-type"] || "application/pdf";
 
-    // Set headers for inline viewing (not download)
     res.setHeader("Content-Type", contentType);
     res.setHeader(
       "Content-Disposition",
