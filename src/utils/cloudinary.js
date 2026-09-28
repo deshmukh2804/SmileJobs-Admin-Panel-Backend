@@ -1,71 +1,51 @@
+// FILE: backend/src/utils/cloudinary.js
 const cloudinary = require("cloudinary").v2;
-const { Readable } = require("stream");
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true,
 });
 
-const uploadToCloudinary = (fileBuffer, folder, options = {}) => {
-  return new Promise((resolve, reject) => {
-    const uploadOptions = {
-      folder,
-      resource_type: "image",
-      allowed_formats: ["jpg", "jpeg", "png", "gif", "webp", "svg"],
-      max_bytes: 5 * 1024 * 1024,
-      ...options,
-    };
+/**
+ * Generate a signed URL for private/authenticated resources
+ * Works for both raw (PDF, DOC) and image delivery types
+ */
+const generateSignedUrl = (publicId, options = {}) => {
+  const {
+    resourceType = "auto",
+    type = "upload",
+    format,
+    expiresInSeconds = 3600,
+  } = options;
 
-    const uploadStream = cloudinary.uploader.upload_stream(
-      uploadOptions,
-      (error, result) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve({
-            url: result.secure_url,
-            publicId: result.public_id,
-            width: result.width,
-            height: result.height,
-            format: result.format,
-            resourceType: result.resource_type,
-          });
-        }
-      }
-    );
+  const expiresAt = Math.floor(Date.now() / 1000) + expiresInSeconds;
 
-    const readableStream = new Readable();
-    readableStream.push(fileBuffer);
-    readableStream.push(null);
-    readableStream.pipe(uploadStream);
+  return cloudinary.utils.private_download_url(publicId, format || "pdf", {
+    resource_type: resourceType,
+    type,
+    expires_at: expiresAt,
+    attachment: false,
   });
 };
 
-const deleteFromCloudinary = async (publicId) => {
-  try {
-    const result = await cloudinary.uploader.destroy(publicId);
-    return result;
-  } catch (error) {
-    console.error("Cloudinary delete error:", error.message);
-    throw error;
-  }
-};
-
-const deleteMultipleFromCloudinary = async (publicIds) => {
-  try {
-    if (!publicIds || publicIds.length === 0) return null;
-    const result = await cloudinary.api.delete_resources(publicIds);
-    return result;
-  } catch (error) {
-    console.error("Cloudinary bulk delete error:", error.message);
-    throw error;
-  }
+/**
+ * Get the direct URL with sign_url option for authenticated files
+ */
+const getAuthenticatedUrl = (publicId, options = {}) => {
+  const { resourceType = "image", format = "pdf", type = "upload" } = options;
+  return cloudinary.url(publicId, {
+    resource_type: resourceType,
+    type,
+    format,
+    sign_url: true,
+    secure: true,
+  });
 };
 
 module.exports = {
   cloudinary,
-  uploadToCloudinary,
-  deleteFromCloudinary,
-  deleteMultipleFromCloudinary,
+  generateSignedUrl,
+  getAuthenticatedUrl,
 };

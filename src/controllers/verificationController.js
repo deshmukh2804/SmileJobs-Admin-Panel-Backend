@@ -1,8 +1,10 @@
 // FILE: backend/src/controllers/verificationController.js
+const axios = require("axios");
 const Verification = require("../models/Verification");
 const RecruiterProfile = require("../models/RecruiterProfile");
 const { logAudit } = require("../utils/auditLogger");
 const { sendEmail } = require("../utils/mailer");
+const { cloudinary } = require("../utils/cloudinary");
 
 // ─── Helpers ──────────────────────────────────────────────────
 const getInitials = (name = "") =>
@@ -39,6 +41,9 @@ const DOC_TYPE_LABELS = {
 
 const APP_NAME = process.env.APP_NAME || "Smile Jobs";
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+const BACKEND_URL =
+  process.env.BACKEND_URL ||
+  "https://smilejobs-admin-panel-backend.onrender.com";
 
 // ─── EMAIL TEMPLATES ──────────────────────────────────────────
 const buildApprovalEmail = (recruiterName, companyName) => `
@@ -146,30 +151,6 @@ const detectFormatFromUrl = (url = "", docName = "") => {
   return "";
 };
 
-// ─── HELPER: Enrich Verification with Recruiter Profile ───────
-const enrichVerificationRecord = async (v) => {
-  const record = v.toObject ? v.toObject() : v;
-
-  let recruiter = null;
-  if (record.recruiterId) {
-    try {
-      recruiter = await RecruiterProfile.findById(record.recruiterId).lean();
-    } catch (err) {
-      console.warn("Recruiter profile lookup failed:", err.message);
-    }
-  }
-
-  // If verification companyName is empty, use recruiter's data
-  const companyName =
-    record.companyName ||
-    record.companySnapshot?.name ||
-    recruiter?.companyProfile?.name ||
-    recruiter?.companyName ||
-    "Unnamed Company";
-
-  return { record, recruiter, companyName };
-};
-
 // ─── DATA TRANSFORMERS ────────────────────────────────────────
 const transformToListItem = (v, recruiter = null) => {
   const companyName =
@@ -211,8 +192,6 @@ const transformToListItem = (v, recruiter = null) => {
 
 /**
  * GET /api/v1/verifications
- * List verifications with filters, search, pagination
- * IMPORTANT: Excludes "not_submitted" by default (only admin-actionable records)
  */
 const getVerifications = async (req, res) => {
   try {
@@ -230,7 +209,6 @@ const getVerifications = async (req, res) => {
     if (status && status !== "all") {
       filter.status = status;
     } else if (includeNotSubmitted !== "true") {
-      // Exclude not_submitted from "all" view by default
       filter.status = { $ne: "not_submitted" };
     }
 
@@ -271,7 +249,6 @@ const getVerifications = async (req, res) => {
       ]),
     ]);
 
-    // Enrich each item with recruiter data if companyName is blank
     const recruiterIds = items
       .filter((i) => !i.companyName && i.recruiterId)
       .map((i) => i.recruiterId);
@@ -331,7 +308,6 @@ const getVerifications = async (req, res) => {
 
 /**
  * GET /api/v1/verifications/:id
- * Get full verification detail + recruiter profile
  */
 const getVerificationById = async (req, res) => {
   try {
@@ -342,7 +318,6 @@ const getVerificationById = async (req, res) => {
         .json({ success: false, message: "Verification request not found" });
     }
 
-    // Fetch full recruiter profile
     let recruiter = null;
     if (verification.recruiterId) {
       try {
@@ -378,7 +353,6 @@ const getVerificationById = async (req, res) => {
       clarificationDocs: verification.clarificationDocs || [],
       clarificationMessage: verification.clarificationMessage || "",
 
-      // Company info (from snapshot + recruiter profile)
       company: {
         name: companyName,
         industry:
@@ -459,7 +433,6 @@ const getVerificationById = async (req, res) => {
         perks: recruiter?.companyProfile?.perks || recruiter?.perks || [],
       },
 
-      // Recruiter info
       recruiter: {
         id: verification.recruiterId
           ? String(verification.recruiterId)
@@ -485,8 +458,7 @@ const getVerificationById = async (req, res) => {
           recruiter?.verificationStatus || verification.status || "pending",
         lastLogin: recruiter?.lastLogin || null,
         contactPerson:
-          recruiter?.companyProfile?.contactPerson ||
-          {
+          recruiter?.companyProfile?.contactPerson || {
             name:
               verification.companySnapshot?.contactPersonName ||
               recruiter?.name ||
@@ -512,7 +484,7 @@ const getVerificationById = async (req, res) => {
           "",
       },
 
-      // Documents — supports PDF, images, docs
+      // Documents — with proxy URL for PDFs to bypass Cloudinary ACL block
       documents: (verification.documents || []).map((d) => {
         const detectedFormat = (d.format || "").toLowerCase();
         const finalFormat =
@@ -525,12 +497,10 @@ const getVerificationById = async (req, res) => {
           finalFormat
         );
 
-        // Cloudinary raw PDFs — ensure the URL works for iframe embedding
-        let viewableUrl = d.url;
-        if (isPdf && d.url && d.url.includes("cloudinary.com")) {
-          // If Cloudinary stored it as raw/authenticated, keep as-is
-          viewableUrl = d.url;
-        }
+        // ⚡ For PDFs, route through our backend proxy to bypass Cloudinary 401 error
+        const viewableUrl = isPdf
+          ? `${BACKEND_URL}/api/v1/verifications/${verification._id}/documents/${d._id}/proxy`
+          : d.url;
 
         return {
           id: String(d._id),
@@ -538,7 +508,8 @@ const getVerificationById = async (req, res) => {
           docTypeLabel: DOC_TYPE_LABELS[d.docType] || d.docType,
           docName: d.docName,
           url: viewableUrl,
-          downloadUrl: d.url,
+          downloadUrl: viewableUrl,
+          originalUrl: d.url,
           publicId: d.public_id,
           format: finalFormat,
           size: d.size || 0,
@@ -562,6 +533,120 @@ const getVerificationById = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to fetch verification detail: " + error.message,
+    });
+  }
+};
+
+/**
+ * GET /api/v1/verifications/:id/documents/:docId/proxy
+ * ⚡ PDF Proxy — Fetches PDFs from Cloudinary using signed authentication,
+ * then streams them to the admin browser. Bypasses CORS & Cloudinary 401 ACL errors.
+ */
+const proxyDocument = async (req, res) => {
+  try {
+    const { id, docId } = req.params;
+
+    const verification = await Verification.findById(id).lean();
+    if (!verification) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Verification not found" });
+    }
+
+    const doc = (verification.documents || []).find(
+      (d) => String(d._id) === String(docId)
+    );
+
+    if (!doc) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Document not found" });
+    }
+
+    const publicId = doc.public_id;
+    const format = (doc.format || "pdf").toLowerCase();
+
+    // ⚡ Try multiple Cloudinary URL strategies for robust delivery
+    const attempts = [
+      // Strategy 1: Signed URL with authenticated type (secure)
+      cloudinary.url(publicId, {
+        resource_type: "image",
+        type: "authenticated",
+        format,
+        sign_url: true,
+        secure: true,
+      }),
+      // Strategy 2: Signed URL with upload type
+      cloudinary.url(publicId, {
+        resource_type: "image",
+        type: "upload",
+        format,
+        sign_url: true,
+        secure: true,
+      }),
+      // Strategy 3: Raw resource type
+      cloudinary.url(publicId, {
+        resource_type: "raw",
+        type: "upload",
+        format,
+        sign_url: true,
+        secure: true,
+      }),
+      // Strategy 4: Original stored URL as final fallback
+      doc.url,
+    ];
+
+    let fetchedResponse = null;
+    let lastError = null;
+
+    for (const attemptUrl of attempts) {
+      try {
+        const response = await axios.get(attemptUrl, {
+          responseType: "arraybuffer",
+          timeout: 20000,
+          validateStatus: (s) => s >= 200 && s < 300,
+        });
+        if (response.data && response.data.byteLength > 0) {
+          fetchedResponse = response;
+          break;
+        }
+      } catch (err) {
+        lastError = err.message;
+        continue;
+      }
+    }
+
+    if (!fetchedResponse) {
+      console.error(`❌ PDF Proxy failed for doc ${docId}:`, lastError);
+      return res.status(502).json({
+        success: false,
+        message: "Failed to fetch document from storage",
+        error: lastError,
+      });
+    }
+
+    // Determine content type
+    const contentType =
+      fetchedResponse.headers["content-type"] ||
+      (format === "pdf" ? "application/pdf" : "application/octet-stream");
+
+    // Set headers for inline viewing (not download)
+    res.setHeader("Content-Type", contentType);
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${doc.docName || "document.pdf"}"`
+    );
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+
+    return res.send(Buffer.from(fetchedResponse.data));
+  } catch (error) {
+    console.error("Proxy Document Error:", error.message);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to proxy document",
+      error: error.message,
     });
   }
 };
@@ -596,7 +681,6 @@ const approveVerification = async (req, res) => {
     verification.rejectionReason = "";
     await verification.save();
 
-    // Sync recruiter profile
     if (verification.recruiterId) {
       try {
         await RecruiterProfile.findByIdAndUpdate(
@@ -617,7 +701,6 @@ const approveVerification = async (req, res) => {
       }
     }
 
-    // Email recruiter
     if (verification.recruiterEmail) {
       try {
         const emailResult = await sendEmail({
@@ -633,15 +716,12 @@ const approveVerification = async (req, res) => {
           console.log(
             `📧 Approval email delivered to ${verification.recruiterEmail}`
           );
-        } else {
-          console.warn(`⚠️ Approval email skipped: ${emailResult.error}`);
         }
       } catch (mailErr) {
         console.error("Approval email failed:", mailErr.message);
       }
     }
 
-    // Audit log
     await logAudit(req, {
       action: "APPROVE_VERIFICATION",
       category: "verification",
@@ -697,7 +777,6 @@ const rejectVerification = async (req, res) => {
     verification.adminNotes = adminNotes;
     await verification.save();
 
-    // Sync recruiter profile
     if (verification.recruiterId) {
       try {
         await RecruiterProfile.findByIdAndUpdate(verification.recruiterId, {
@@ -714,7 +793,6 @@ const rejectVerification = async (req, res) => {
       }
     }
 
-    // Email recruiter
     if (verification.recruiterEmail) {
       try {
         const emailResult = await sendEmail({
@@ -731,8 +809,6 @@ const rejectVerification = async (req, res) => {
           console.log(
             `📧 Rejection email delivered to ${verification.recruiterEmail}`
           );
-        } else {
-          console.warn(`⚠️ Rejection email skipped: ${emailResult.error}`);
         }
       } catch (mailErr) {
         console.error("Rejection email failed:", mailErr.message);
@@ -793,7 +869,6 @@ const requestClarification = async (req, res) => {
     verification.clarificationMessage = message;
     await verification.save();
 
-    // Sync recruiter profile
     if (verification.recruiterId) {
       try {
         await RecruiterProfile.findByIdAndUpdate(verification.recruiterId, {
@@ -809,7 +884,6 @@ const requestClarification = async (req, res) => {
       }
     }
 
-    // Email recruiter
     if (verification.recruiterEmail) {
       try {
         const emailResult = await sendEmail({
@@ -827,8 +901,6 @@ const requestClarification = async (req, res) => {
           console.log(
             `📧 Clarification email delivered to ${verification.recruiterEmail}`
           );
-        } else {
-          console.warn(`⚠️ Clarification email skipped: ${emailResult.error}`);
         }
       } catch (mailErr) {
         console.error("Clarification email failed:", mailErr.message);
@@ -919,4 +991,5 @@ module.exports = {
   rejectVerification,
   requestClarification,
   getStats,
+  proxyDocument,
 };

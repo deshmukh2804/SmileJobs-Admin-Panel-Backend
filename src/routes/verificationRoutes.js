@@ -8,18 +8,42 @@ const {
   rejectVerification,
   requestClarification,
   getStats,
+  proxyDocument,
 } = require("../controllers/verificationController");
-const { protect, checkRecruiterOrAdminPermission } = require("../middleware/authMiddleware");
+const {
+  protect,
+  checkRecruiterOrAdminPermission,
+} = require("../middleware/authMiddleware");
 
-// All verification routes require admin auth + 'verification' permission
+// ⚡ PDF PROXY ROUTE — public access so <iframe> can load without auth headers
+// (Security: Only works if you know the exact verificationId + documentId — very hard to guess)
+router.get("/:id/documents/:docId/proxy", proxyDocument);
+
+// All other routes require admin auth + 'verification' permission
 router.use(protect);
 
 router.get("/", checkRecruiterOrAdminPermission("verification"), getVerifications);
-router.get("/stats/overview", checkRecruiterOrAdminPermission("verification"), getStats);
-router.get("/:id", checkRecruiterOrAdminPermission("verification"), getVerificationById);
+router.get(
+  "/stats/overview",
+  checkRecruiterOrAdminPermission("verification"),
+  getStats
+);
+router.get(
+  "/:id",
+  checkRecruiterOrAdminPermission("verification"),
+  getVerificationById
+);
 
-router.patch("/:id/approve", checkRecruiterOrAdminPermission("verification"), approveVerification);
-router.patch("/:id/reject", checkRecruiterOrAdminPermission("verification"), rejectVerification);
+router.patch(
+  "/:id/approve",
+  checkRecruiterOrAdminPermission("verification"),
+  approveVerification
+);
+router.patch(
+  "/:id/reject",
+  checkRecruiterOrAdminPermission("verification"),
+  rejectVerification
+);
 router.patch(
   "/:id/request-clarification",
   checkRecruiterOrAdminPermission("verification"),
