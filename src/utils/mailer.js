@@ -12,30 +12,33 @@ const getTransporter = () => {
   if (transporter) return transporter;
 
   const host = process.env.SMTP_HOST || process.env.EMAIL_HOST || "smtp-relay.brevo.com";
-  const port = parseInt(process.env.SMTP_PORT || process.env.EMAIL_PORT || "587", 10);
+  // Default to 2525 for cloud hosting compatibility (Render/AWS), fallback to 587
+  const port = parseInt(process.env.SMTP_PORT || process.env.EMAIL_PORT || "2525", 10);
   const user = process.env.SMTP_USER || process.env.EMAIL_USER;
   const pass = process.env.SMTP_PASS || process.env.EMAIL_PASS;
+  const isSecure = port === 465;
 
   if (!user || !pass) {
-    console.error("⚠️ SMTP Warning: Credentials are not defined in your environment variables (.env).");
+    console.error("⚠️ SMTP Warning: Credentials are not defined in environment variables.");
   }
 
   transporter = nodemailer.createTransport({
     host,
     port,
-    secure: port === 465, // True for port 465, false for 587 or other ports
+    secure: isSecure, // true for 465, false for other ports (587, 2525)
     auth: {
       user,
       pass,
     },
     tls: {
-      rejectUnauthorized: false, // Prevents self-signed certificate issues in various hosting environments
+      rejectUnauthorized: false,
     },
-    pool: true, // Use connection pooling for high-volume transactional mail
+    connectionTimeout: 10000, // 10s connection timeout
+    greetingTimeout: 10000,   // 10s greeting timeout
+    socketTimeout: 15000,     // 15s socket timeout
+    pool: true,
     maxConnections: 5,
     maxMessages: 100,
-    rateDelta: 1000,
-    rateLimit: 5, // Process up to 5 emails per second per connection
   });
 
   return transporter;
@@ -54,14 +57,17 @@ const verifyConnection = async () => {
   }
 };
 
-// Execute self-check on boot safely without blocking the event loop
+// Safe startup check
 (async () => {
-  const result = await verifyConnection();
-  if (result.success) {
-    console.log(`✅ Brevo SMTP Connection Verified for: ${process.env.EMAIL_FROM || "info.smilejobs@gmail.com"}`);
-  } else {
-    console.error("❌ Brevo SMTP Handshake Failed. Verify SMTP_PASS or check Authorized IPs in Brevo security settings.");
-    console.error(`Details: ${result.error}`);
+  try {
+    const result = await verifyConnection();
+    if (result.success) {
+      console.log(`✅ Brevo SMTP Connection Verified for: ${process.env.EMAIL_FROM || "info.smilejobs@gmail.com"}`);
+    } else {
+      console.warn(`⚠️ Brevo SMTP handshake notice: ${result.error}`);
+    }
+  } catch (err) {
+    console.warn(`⚠️ Brevo SMTP init notice: ${err.message}`);
   }
 })();
 
@@ -72,7 +78,7 @@ const APP_NAME = process.env.APP_NAME || "Smile Jobs";
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 
 /**
- * Filters out invalid address targets and mock handles
+ * Validates real email addresses and excludes internal mock handles
  */
 const isValidDeliverableEmail = (email) => {
   if (!email || typeof email !== "string") return false;
@@ -83,7 +89,7 @@ const isValidDeliverableEmail = (email) => {
 };
 
 /**
- * Send a single email with production safety parameters
+ * Send a single email
  */
 const sendEmail = async ({ to, subject, html, text, attachments = [] }) => {
   try {
@@ -103,7 +109,7 @@ const sendEmail = async ({ to, subject, html, text, attachments = [] }) => {
       replyTo: REPLY_TO,
       subject: subject.trim(),
       html,
-      text: text || html.replace(/<[^>]*>/g, ""), // Automated text fallback
+      text: text || html.replace(/<[^>]*>/g, ""),
       attachments,
     };
 
@@ -117,7 +123,7 @@ const sendEmail = async ({ to, subject, html, text, attachments = [] }) => {
 };
 
 /**
- * Send bulk emails asynchronously in controlled batches
+ * Send bulk emails in controlled batches
  */
 const sendBulkEmail = async (
   recipients,
@@ -134,7 +140,6 @@ const sendBulkEmail = async (
     errors: [],
   };
 
-  // Filter deliverable targets
   const validRecipients = [];
   for (const r of recipients) {
     const email = typeof r === "string" ? r : r?.email;
@@ -145,7 +150,6 @@ const sendBulkEmail = async (
     }
   }
 
-  // Segment targets into delivery runs
   const batches = [];
   for (let i = 0; i < validRecipients.length; i += batchSize) {
     batches.push(validRecipients.slice(i, i + batchSize));
@@ -199,7 +203,7 @@ const sendBulkEmail = async (
 };
 
 /**
- * Consistent HTML layout wrapper with branding
+ * Branded HTML layout wrapper
  */
 const wrapEmailTemplate = (content, options = {}) => {
   const { heading = APP_NAME, footerNote = "", buttonText, buttonUrl } = options;
