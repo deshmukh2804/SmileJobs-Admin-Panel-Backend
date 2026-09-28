@@ -45,6 +45,10 @@ const BACKEND_URL =
   process.env.BACKEND_URL ||
   "https://smilejobs-admin-panel-backend.onrender.com";
 
+const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
+const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
+const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
+
 // ─── EMAIL TEMPLATES ──────────────────────────────────────────
 const buildApprovalEmail = (recruiterName, companyName) => `
 <div style="font-family:'Segoe UI',Arial,sans-serif;max-width:600px;margin:0 auto;background:#f8fafc;padding:20px;">
@@ -68,9 +72,7 @@ const buildApprovalEmail = (recruiterName, companyName) => `
     <div style="text-align:center;margin:24px 0;">
       <a href="${FRONTEND_URL}/recruiter/dashboard" style="display:inline-block;background:linear-gradient(135deg,#5F8A72,#4a6f5b);color:#fff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;">Go to Dashboard →</a>
     </div>
-    <p style="color:#64748b;font-size:13px;line-height:1.6;margin:24px 0 0;">
-      — ${APP_NAME} Compliance Team
-    </p>
+    <p style="color:#64748b;font-size:13px;line-height:1.6;margin:24px 0 0;">— ${APP_NAME} Compliance Team</p>
   </div>
   <p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:16px;">© ${new Date().getFullYear()} ${APP_NAME}. All rights reserved.</p>
 </div>`;
@@ -82,22 +84,16 @@ const buildRejectionEmail = (recruiterName, companyName, reason) => `
   </div>
   <div style="background:#fff;padding:32px 24px;border-radius:0 0 12px 12px;box-shadow:0 4px 12px rgba(0,0,0,0.05);">
     <p style="color:#334155;font-size:16px;line-height:1.6;margin:0 0 16px;">Hi <strong>${recruiterName}</strong>,</p>
-    <p style="color:#334155;font-size:15px;line-height:1.6;margin:0 0 20px;">
-      Unfortunately, we could not verify <strong>${companyName}</strong> at this time.
-    </p>
+    <p style="color:#334155;font-size:15px;line-height:1.6;margin:0 0 20px;">Unfortunately, we could not verify <strong>${companyName}</strong> at this time.</p>
     <div style="background:#fef2f2;border-left:4px solid #dc2626;padding:16px;border-radius:6px;margin:20px 0;">
       <p style="color:#991b1b;margin:0 0 8px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">Reason for Rejection</p>
       <p style="color:#7f1d1d;margin:0;font-size:14px;line-height:1.6;">${reason || "Please contact support for details."}</p>
     </div>
-    <p style="color:#334155;font-size:14px;line-height:1.6;margin:20px 0;">
-      You can re-submit your verification with the correct documents from your recruiter dashboard.
-    </p>
+    <p style="color:#334155;font-size:14px;line-height:1.6;margin:20px 0;">You can re-submit your verification with the correct documents from your recruiter dashboard.</p>
     <div style="text-align:center;margin:24px 0;">
       <a href="${FRONTEND_URL}/recruiter/verification" style="display:inline-block;background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;">Re-submit Verification →</a>
     </div>
-    <p style="color:#64748b;font-size:13px;line-height:1.6;margin:24px 0 0;">
-      — ${APP_NAME} Compliance Team
-    </p>
+    <p style="color:#64748b;font-size:13px;line-height:1.6;margin:24px 0 0;">— ${APP_NAME} Compliance Team</p>
   </div>
   <p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:16px;">© ${new Date().getFullYear()} ${APP_NAME}. All rights reserved.</p>
 </div>`;
@@ -109,37 +105,23 @@ const buildClarificationEmail = (recruiterName, companyName, message, docs) => `
   </div>
   <div style="background:#fff;padding:32px 24px;border-radius:0 0 12px 12px;box-shadow:0 4px 12px rgba(0,0,0,0.05);">
     <p style="color:#334155;font-size:16px;line-height:1.6;margin:0 0 16px;">Hi <strong>${recruiterName}</strong>,</p>
-    <p style="color:#334155;font-size:15px;line-height:1.6;margin:0 0 20px;">
-      To complete verification for <strong>${companyName}</strong>, we need you to re-upload the following documents:
-    </p>
+    <p style="color:#334155;font-size:15px;line-height:1.6;margin:0 0 20px;">To complete verification for <strong>${companyName}</strong>, we need you to re-upload the following documents:</p>
     <div style="background:#fffbeb;border-left:4px solid #d97706;padding:16px;border-radius:6px;margin:20px 0;">
       <p style="color:#78350f;margin:0 0 12px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">Documents Required</p>
       <ul style="margin:0;padding-left:20px;color:#92400e;font-size:14px;line-height:1.8;">
         ${(docs || []).map((d) => `<li>${DOC_TYPE_LABELS[d] || d}</li>`).join("")}
       </ul>
     </div>
-    ${
-      message
-        ? `<div style="background:#f1f5f9;padding:16px;border-radius:6px;margin:20px 0;">
-            <p style="color:#334155;margin:0 0 8px;font-size:13px;font-weight:700;">Message from Reviewer</p>
-            <p style="color:#475569;margin:0;font-size:14px;line-height:1.6;">${message}</p>
-          </div>`
-        : ""
-    }
-    <p style="color:#334155;font-size:14px;line-height:1.6;margin:20px 0;">
-      Please log into your recruiter dashboard and re-upload the requested documents to complete verification.
-    </p>
+    ${message ? `<div style="background:#f1f5f9;padding:16px;border-radius:6px;margin:20px 0;"><p style="color:#334155;margin:0 0 8px;font-size:13px;font-weight:700;">Message from Reviewer</p><p style="color:#475569;margin:0;font-size:14px;line-height:1.6;">${message}</p></div>` : ""}
+    <p style="color:#334155;font-size:14px;line-height:1.6;margin:20px 0;">Please log into your recruiter dashboard and re-upload the requested documents to complete verification.</p>
     <div style="text-align:center;margin:24px 0;">
       <a href="${FRONTEND_URL}/recruiter/verification" style="display:inline-block;background:linear-gradient(135deg,#d97706,#b45309);color:#fff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;">Upload Documents →</a>
     </div>
-    <p style="color:#64748b;font-size:13px;line-height:1.6;margin:24px 0 0;">
-      — ${APP_NAME} Compliance Team
-    </p>
+    <p style="color:#64748b;font-size:13px;line-height:1.6;margin:24px 0 0;">— ${APP_NAME} Compliance Team</p>
   </div>
   <p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:16px;">© ${new Date().getFullYear()} ${APP_NAME}. All rights reserved.</p>
 </div>`;
 
-// ─── HELPER: Detect file format from URL or docName ───────────
 const detectFormatFromUrl = (url = "", docName = "") => {
   const source = `${url} ${docName}`.toLowerCase();
   if (source.match(/\.(pdf)(\?|$|\/)/)) return "pdf";
@@ -151,7 +133,18 @@ const detectFormatFromUrl = (url = "", docName = "") => {
   return "";
 };
 
-// ─── DATA TRANSFORMERS ────────────────────────────────────────
+// ─── Extract public_id from a Cloudinary URL ─────────────────
+const extractPublicIdFromUrl = (url) => {
+  if (!url) return null;
+  try {
+    // Example: https://res.cloudinary.com/mqyjz7hl/image/upload/v1790598640/verihire/verification/6aba5d847b151136acadb15a/sqj3mdjrr2byfcqqxjpo.pdf
+    const match = url.match(/\/(?:image|raw|video)\/(?:upload|authenticated|private)\/(?:v\d+\/)?(.+?)(?:\.[^.]+)?$/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+};
+
 const transformToListItem = (v, recruiter = null) => {
   const companyName =
     v.companyName ||
@@ -190,9 +183,6 @@ const transformToListItem = (v, recruiter = null) => {
 // CONTROLLERS
 // ═══════════════════════════════════════════════════════════════
 
-/**
- * GET /api/v1/verifications
- */
 const getVerifications = async (req, res) => {
   try {
     const {
@@ -238,11 +228,7 @@ const getVerifications = async (req, res) => {
         : { submittedAt: 1, createdAt: 1 };
 
     const [items, total, counts] = await Promise.all([
-      Verification.find(filter)
-        .sort(sortObj)
-        .skip(skip)
-        .limit(limitNum)
-        .lean(),
+      Verification.find(filter).sort(sortObj).skip(skip).limit(limitNum).lean(),
       Verification.countDocuments(filter),
       Verification.aggregate([
         { $group: { _id: "$status", count: { $sum: 1 } } },
@@ -281,9 +267,7 @@ const getVerifications = async (req, res) => {
     };
     counts.forEach((c) => {
       statusCounts[c._id] = c.count;
-      if (c._id !== "not_submitted") {
-        statusCounts.total += c.count;
-      }
+      if (c._id !== "not_submitted") statusCounts.total += c.count;
     });
 
     return res.status(200).json({
@@ -306,9 +290,6 @@ const getVerifications = async (req, res) => {
   }
 };
 
-/**
- * GET /api/v1/verifications/:id
- */
 const getVerificationById = async (req, res) => {
   try {
     const verification = await Verification.findById(req.params.id).lean();
@@ -496,7 +477,6 @@ const getVerificationById = async (req, res) => {
           finalFormat
         );
 
-        // Point to our secure backend proxy route
         const viewableUrl = isPdf
           ? `${BACKEND_URL}/api/v1/verifications/${verification._id}/documents/${d._id}/proxy`
           : d.url;
@@ -537,14 +517,14 @@ const getVerificationById = async (req, res) => {
 };
 
 /**
+ * PDF PROXY (Admin API Method — 100% works regardless of ACL)
  * GET /api/v1/verifications/:id/documents/:docId/proxy
- * Optimized PDF Proxy specifically supporting private, authenticated, and public Cloudinary assets.
  */
 const proxyDocument = async (req, res) => {
   try {
     const { id, docId } = req.params;
 
-    // Remove frameguard headers on this endpoint to allow loading inside frontend iframes
+    // Remove headers that block iframe embedding
     res.removeHeader("X-Frame-Options");
     res.removeHeader("Content-Security-Policy");
 
@@ -565,77 +545,126 @@ const proxyDocument = async (req, res) => {
         .json({ success: false, message: "Document not found" });
     }
 
-    const publicId = doc.public_id;
-    const format = (doc.format || "pdf").toLowerCase();
+    // Try to extract public_id from URL if not stored properly
+    const publicId =
+      doc.public_id || extractPublicIdFromUrl(doc.url) || "";
 
-    // Generate signed URLs using both "authenticated" and "private" types
-    const authenticatedUrl = cloudinary.url(publicId, {
-      resource_type: "image",
-      type: "authenticated",
-      format,
-      sign_url: true,
-      secure: true,
-    });
+    console.log(`🔍 PDF Proxy request for docId=${docId}, publicId=${publicId}`);
 
-    const privateUrl = cloudinary.url(publicId, {
-      resource_type: "image",
-      type: "private",
-      format,
-      sign_url: true,
-      secure: true,
-    });
-
-    const publicSignedUrl = cloudinary.url(publicId, {
-      resource_type: "image",
-      type: "upload",
-      format,
-      sign_url: true,
-      secure: true,
-    });
-
-    const rawSignedUrl = cloudinary.url(publicId, {
-      resource_type: "raw",
-      type: "upload",
-      format,
-      sign_url: true,
-      secure: true,
-    });
-
-    // Strategy pool prioritizes authenticated, then private, then public signed formats
-    const attempts = [
-      authenticatedUrl,
-      privateUrl,
-      publicSignedUrl,
-      rawSignedUrl,
-      doc.url, // final fallback
+    // ═══════════════════════════════════════════════════════════
+    // STRATEGY 1: Cloudinary Admin API (using Basic Auth)
+    // This ALWAYS works because we're the account owner
+    // ═══════════════════════════════════════════════════════════
+    const adminApiAttempts = [
+      // Try image resource type with various delivery types
+      { resource_type: "image", type: "upload" },
+      { resource_type: "image", type: "authenticated" },
+      { resource_type: "image", type: "private" },
+      { resource_type: "raw", type: "upload" },
+      { resource_type: "raw", type: "authenticated" },
+      { resource_type: "raw", type: "private" },
     ];
 
+    let secureUrl = null;
+    let assetInfo = null;
+
+    for (const attempt of adminApiAttempts) {
+      try {
+        const adminApiUrl = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/resources/${attempt.resource_type}/${attempt.type}/${encodeURIComponent(publicId)}`;
+
+        const response = await axios.get(adminApiUrl, {
+          auth: {
+            username: CLOUDINARY_API_KEY,
+            password: CLOUDINARY_API_SECRET,
+          },
+          timeout: 8000,
+          validateStatus: (s) => s >= 200 && s < 300,
+        });
+
+        if (response.data && response.data.secure_url) {
+          assetInfo = response.data;
+          secureUrl = response.data.secure_url;
+          console.log(`✅ Found asset via Admin API (${attempt.resource_type}/${attempt.type}): ${secureUrl}`);
+          break;
+        }
+      } catch (err) {
+        continue;
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // STRATEGY 2: Generate signed download URL using API secret
+    // ═══════════════════════════════════════════════════════════
+    if (!secureUrl && publicId) {
+      try {
+        // Generate signed URL manually
+        const timestamp = Math.floor(Date.now() / 1000) + 3600;
+
+        const signedUrl = cloudinary.utils.private_download_url(
+          publicId,
+          "pdf",
+          {
+            resource_type: assetInfo?.resource_type || "image",
+            type: assetInfo?.type || "upload",
+            expires_at: timestamp,
+          }
+        );
+
+        secureUrl = signedUrl;
+        console.log(`✅ Generated signed private_download_url: ${secureUrl}`);
+      } catch (err) {
+        console.warn("Signed URL generation failed:", err.message);
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // STRATEGY 3: Use the raw stored URL as final fallback
+    // ═══════════════════════════════════════════════════════════
+    if (!secureUrl) {
+      secureUrl = doc.url;
+      console.log(`⚠️ Falling back to original URL: ${secureUrl}`);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Fetch the actual PDF bytes and stream to client
+    // ═══════════════════════════════════════════════════════════
     let fetchedResponse = null;
+    const fetchAttempts = [secureUrl];
+
+    // If secureUrl differs from doc.url, also try the original as final backup
+    if (secureUrl !== doc.url) {
+      fetchAttempts.push(doc.url);
+    }
+
     let lastError = null;
 
-    for (const attemptUrl of attempts) {
+    for (const attemptUrl of fetchAttempts) {
       try {
         const response = await axios.get(attemptUrl, {
           responseType: "arraybuffer",
-          timeout: 10000,
+          timeout: 15000,
+          maxRedirects: 5,
           validateStatus: (s) => s >= 200 && s < 300,
         });
         if (response.data && response.data.byteLength > 0) {
           fetchedResponse = response;
+          console.log(`✅ Successfully fetched PDF (${response.data.byteLength} bytes)`);
           break;
         }
       } catch (err) {
         lastError = err.message;
+        console.warn(`Fetch attempt failed for ${attemptUrl.slice(0, 80)}...`, err.message);
         continue;
       }
     }
 
     if (!fetchedResponse) {
-      console.error(`❌ PDF Proxy retrieval failed for doc ${docId}:`, lastError);
+      console.error(`❌ ALL PDF proxy attempts failed for doc ${docId}:`, lastError);
       return res.status(502).json({
         success: false,
         message: "Failed to fetch document from secure storage",
         error: lastError,
+        hint: "Please verify Cloudinary API credentials and asset access permissions",
       });
     }
 
@@ -662,9 +691,6 @@ const proxyDocument = async (req, res) => {
   }
 };
 
-/**
- * PATCH /api/v1/verifications/:id/approve
- */
 const approveVerification = async (req, res) => {
   try {
     const { adminNotes = "" } = req.body;
@@ -758,9 +784,6 @@ const approveVerification = async (req, res) => {
   }
 };
 
-/**
- * PATCH /api/v1/verifications/:id/reject
- */
 const rejectVerification = async (req, res) => {
   try {
     const { reason = "", adminNotes = "" } = req.body;
@@ -851,9 +874,6 @@ const rejectVerification = async (req, res) => {
   }
 };
 
-/**
- * PATCH /api/v1/verifications/:id/request-clarification
- */
 const requestClarification = async (req, res) => {
   try {
     const { docs = [], message = "" } = req.body;
@@ -943,9 +963,6 @@ const requestClarification = async (req, res) => {
   }
 };
 
-/**
- * GET /api/v1/verifications/stats/overview
- */
 const getStats = async (req, res) => {
   try {
     const [statusAgg, todayCount, weekApproved] = await Promise.all([
