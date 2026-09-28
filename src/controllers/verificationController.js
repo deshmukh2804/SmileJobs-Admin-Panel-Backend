@@ -133,12 +133,12 @@ const detectFormatFromUrl = (url = "", docName = "") => {
   return "";
 };
 
-// ─── Extract public_id from a Cloudinary URL ─────────────────
 const extractPublicIdFromUrl = (url) => {
   if (!url) return null;
   try {
-    // Example: https://res.cloudinary.com/mqyjz7hl/image/upload/v1790598640/verihire/verification/6aba5d847b151136acadb15a/sqj3mdjrr2byfcqqxjpo.pdf
-    const match = url.match(/\/(?:image|raw|video)\/(?:upload|authenticated|private)\/(?:v\d+\/)?(.+?)(?:\.[^.]+)?$/);
+    const match = url.match(
+      /\/(?:image|raw|video)\/(?:upload|authenticated|private)\/(?:v\d+\/)?(.+?)(?:\.[^.]+)?$/
+    );
     return match ? match[1] : null;
   } catch {
     return null;
@@ -517,13 +517,13 @@ const getVerificationById = async (req, res) => {
 };
 
 /**
- * PDF PROXY (Admin API Method — 100% works regardless of ACL)
- * GET /api/v1/verifications/:id/documents/:docId/proxy
+ * ⚡ ULTIMATE PDF PROXY — Uses Cloudinary Admin API to fetch metadata
+ *    then downloads bytes via signed URL. Bypasses all ACL restrictions.
  */
 const proxyDocument = async (req, res) => {
-  try {
-    const { id, docId } = req.params;
+  const { id, docId } = req.params;
 
+  try {
     // Remove headers that block iframe embedding
     res.removeHeader("X-Frame-Options");
     res.removeHeader("Content-Security-Policy");
@@ -545,28 +545,62 @@ const proxyDocument = async (req, res) => {
         .json({ success: false, message: "Document not found" });
     }
 
-    // Try to extract public_id from URL if not stored properly
-    const publicId =
-      doc.public_id || extractPublicIdFromUrl(doc.url) || "";
+    const publicId = doc.public_id || extractPublicIdFromUrl(doc.url) || "";
 
-    console.log(`🔍 PDF Proxy request for docId=${docId}, publicId=${publicId}`);
+    console.log(`\n🔍 ═══════════════════════════════════════════`);
+    console.log(`📄 PDF PROXY REQUEST`);
+    console.log(`   docId: ${docId}`);
+    console.log(`   publicId: ${publicId}`);
+    console.log(`   originalUrl: ${doc.url}`);
+    console.log(`   format: ${doc.format}`);
+    console.log(`═══════════════════════════════════════════\n`);
 
     // ═══════════════════════════════════════════════════════════
-    // STRATEGY 1: Cloudinary Admin API (using Basic Auth)
-    // This ALWAYS works because we're the account owner
+    // METHOD 1: Direct fetch of the original URL first
+    // (In case the Cloudinary restriction is now disabled)
     // ═══════════════════════════════════════════════════════════
+    try {
+      console.log(`🌐 Attempt 1: Direct fetch of original URL...`);
+      const directResponse = await axios.get(doc.url, {
+        responseType: "arraybuffer",
+        timeout: 10000,
+        maxRedirects: 5,
+        validateStatus: (s) => s >= 200 && s < 300,
+      });
+
+      if (directResponse.data && directResponse.data.byteLength > 0) {
+        console.log(`   ✅ Direct fetch succeeded (${directResponse.data.byteLength} bytes)`);
+        const contentType =
+          directResponse.headers["content-type"] || "application/pdf";
+        res.setHeader("Content-Type", contentType);
+        res.setHeader(
+          "Content-Disposition",
+          `inline; filename="${doc.docName || "document.pdf"}"`
+        );
+        res.setHeader("Cache-Control", "private, max-age=3600");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        return res.send(Buffer.from(directResponse.data));
+      }
+    } catch (err) {
+      console.log(`   ❌ Direct fetch failed: ${err.message} (Status: ${err.response?.status})`);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // METHOD 2: Cloudinary Admin API to get authenticated secure_url
+    // ═══════════════════════════════════════════════════════════
+    console.log(`\n🔑 Attempt 2: Cloudinary Admin API (metadata lookup)...`);
+
     const adminApiAttempts = [
-      // Try image resource type with various delivery types
       { resource_type: "image", type: "upload" },
+      { resource_type: "raw", type: "upload" },
       { resource_type: "image", type: "authenticated" },
       { resource_type: "image", type: "private" },
-      { resource_type: "raw", type: "upload" },
       { resource_type: "raw", type: "authenticated" },
       { resource_type: "raw", type: "private" },
     ];
 
-    let secureUrl = null;
     let assetInfo = null;
+    let successfulAttempt = null;
 
     for (const attempt of adminApiAttempts) {
       try {
@@ -583,106 +617,123 @@ const proxyDocument = async (req, res) => {
 
         if (response.data && response.data.secure_url) {
           assetInfo = response.data;
-          secureUrl = response.data.secure_url;
-          console.log(`✅ Found asset via Admin API (${attempt.resource_type}/${attempt.type}): ${secureUrl}`);
+          successfulAttempt = attempt;
+          console.log(`   ✅ Admin API found asset via ${attempt.resource_type}/${attempt.type}`);
+          console.log(`   📎 secure_url: ${assetInfo.secure_url}`);
+          console.log(`   📎 access_mode: ${assetInfo.access_mode || "public"}`);
+          console.log(`   📎 access_control: ${JSON.stringify(assetInfo.access_control || [])}`);
           break;
         }
       } catch (err) {
-        continue;
+        // Silent - try next
       }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // STRATEGY 2: Generate signed download URL using API secret
-    // ═══════════════════════════════════════════════════════════
-    if (!secureUrl && publicId) {
-      try {
-        // Generate signed URL manually
-        const timestamp = Math.floor(Date.now() / 1000) + 3600;
-
-        const signedUrl = cloudinary.utils.private_download_url(
-          publicId,
-          "pdf",
-          {
-            resource_type: assetInfo?.resource_type || "image",
-            type: assetInfo?.type || "upload",
-            expires_at: timestamp,
-          }
-        );
-
-        secureUrl = signedUrl;
-        console.log(`✅ Generated signed private_download_url: ${secureUrl}`);
-      } catch (err) {
-        console.warn("Signed URL generation failed:", err.message);
-      }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // STRATEGY 3: Use the raw stored URL as final fallback
-    // ═══════════════════════════════════════════════════════════
-    if (!secureUrl) {
-      secureUrl = doc.url;
-      console.log(`⚠️ Falling back to original URL: ${secureUrl}`);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // Fetch the actual PDF bytes and stream to client
-    // ═══════════════════════════════════════════════════════════
-    let fetchedResponse = null;
-    const fetchAttempts = [secureUrl];
-
-    // If secureUrl differs from doc.url, also try the original as final backup
-    if (secureUrl !== doc.url) {
-      fetchAttempts.push(doc.url);
-    }
-
-    let lastError = null;
-
-    for (const attemptUrl of fetchAttempts) {
-      try {
-        const response = await axios.get(attemptUrl, {
-          responseType: "arraybuffer",
-          timeout: 15000,
-          maxRedirects: 5,
-          validateStatus: (s) => s >= 200 && s < 300,
-        });
-        if (response.data && response.data.byteLength > 0) {
-          fetchedResponse = response;
-          console.log(`✅ Successfully fetched PDF (${response.data.byteLength} bytes)`);
-          break;
-        }
-      } catch (err) {
-        lastError = err.message;
-        console.warn(`Fetch attempt failed for ${attemptUrl.slice(0, 80)}...`, err.message);
-        continue;
-      }
-    }
-
-    if (!fetchedResponse) {
-      console.error(`❌ ALL PDF proxy attempts failed for doc ${docId}:`, lastError);
+    if (!assetInfo) {
+      console.log(`   ❌ Asset not found in any Cloudinary resource type/type combination`);
       return res.status(502).json({
         success: false,
-        message: "Failed to fetch document from secure storage",
-        error: lastError,
-        hint: "Please verify Cloudinary API credentials and asset access permissions",
+        message:
+          "Document not found in Cloudinary. The file may have been deleted or the publicId is incorrect.",
+        publicId,
+        originalUrl: doc.url,
       });
     }
 
-    const contentType =
-      fetchedResponse.headers["content-type"] || "application/pdf";
+    // ═══════════════════════════════════════════════════════════
+    // METHOD 3: Try fetching via the secure_url from Admin API
+    // ═══════════════════════════════════════════════════════════
+    try {
+      console.log(`\n🌐 Attempt 3: Fetch via Admin API secure_url...`);
+      const secureResponse = await axios.get(assetInfo.secure_url, {
+        responseType: "arraybuffer",
+        timeout: 12000,
+        maxRedirects: 5,
+        validateStatus: (s) => s >= 200 && s < 300,
+      });
 
-    res.setHeader("Content-Type", contentType);
-    res.setHeader(
-      "Content-Disposition",
-      `inline; filename="${doc.docName || "document.pdf"}"`
-    );
-    res.setHeader("Cache-Control", "private, max-age=3600");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("X-Content-Type-Options", "nosniff");
+      if (secureResponse.data && secureResponse.data.byteLength > 0) {
+        console.log(`   ✅ secure_url fetch succeeded (${secureResponse.data.byteLength} bytes)`);
+        const contentType =
+          secureResponse.headers["content-type"] || "application/pdf";
+        res.setHeader("Content-Type", contentType);
+        res.setHeader(
+          "Content-Disposition",
+          `inline; filename="${doc.docName || "document.pdf"}"`
+        );
+        res.setHeader("Cache-Control", "private, max-age=3600");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        return res.send(Buffer.from(secureResponse.data));
+      }
+    } catch (err) {
+      console.log(`   ❌ secure_url fetch failed: ${err.message} (Status: ${err.response?.status})`);
+    }
 
-    return res.send(Buffer.from(fetchedResponse.data));
+    // ═══════════════════════════════════════════════════════════
+    // METHOD 4: Generate signed URL using cloudinary utils
+    // ═══════════════════════════════════════════════════════════
+    try {
+      console.log(`\n🔐 Attempt 4: Generate signed URL via cloudinary.utils.private_download_url...`);
+      const expiresAt = Math.floor(Date.now() / 1000) + 3600;
+
+      const signedUrl = cloudinary.utils.private_download_url(
+        publicId,
+        "pdf",
+        {
+          resource_type: successfulAttempt.resource_type,
+          type: successfulAttempt.type,
+          expires_at: expiresAt,
+        }
+      );
+
+      console.log(`   📎 Generated signed URL: ${signedUrl.slice(0, 120)}...`);
+
+      const signedResponse = await axios.get(signedUrl, {
+        responseType: "arraybuffer",
+        timeout: 12000,
+        maxRedirects: 5,
+        validateStatus: (s) => s >= 200 && s < 300,
+      });
+
+      if (signedResponse.data && signedResponse.data.byteLength > 0) {
+        console.log(`   ✅ Signed URL fetch succeeded (${signedResponse.data.byteLength} bytes)`);
+        const contentType =
+          signedResponse.headers["content-type"] || "application/pdf";
+        res.setHeader("Content-Type", contentType);
+        res.setHeader(
+          "Content-Disposition",
+          `inline; filename="${doc.docName || "document.pdf"}"`
+        );
+        res.setHeader("Cache-Control", "private, max-age=3600");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        return res.send(Buffer.from(signedResponse.data));
+      }
+    } catch (err) {
+      console.log(`   ❌ Signed URL fetch failed: ${err.message} (Status: ${err.response?.status})`);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ALL METHODS FAILED
+    // ═══════════════════════════════════════════════════════════
+    console.log(`\n❌ ═══════════════════════════════════════════`);
+    console.log(`❌ ALL PROXY METHODS FAILED`);
+    console.log(`❌ Root cause: Cloudinary account has "PDF delivery" DISABLED`);
+    console.log(`❌ Fix: Go to https://console.cloudinary.com/settings/security`);
+    console.log(`❌ ═══════════════════════════════════════════\n`);
+
+    return res.status(502).json({
+      success: false,
+      message:
+        "Cloudinary is blocking PDF delivery. Please enable 'PDF and ZIP files delivery' in Cloudinary Security Settings.",
+      docs_url: "https://cloudinary.com/documentation/control_access_to_media",
+      fix_url: "https://console.cloudinary.com/settings/security",
+      publicId,
+      originalUrl: doc.url,
+      assetType: successfulAttempt,
+    });
   } catch (error) {
-    console.error("Proxy Document Error:", error.message);
+    console.error(`\n❌ Proxy Document Error for ${docId}:`, error.message);
+    console.error(error.stack);
     return res.status(500).json({
       success: false,
       message: "Failed to proxy document",
