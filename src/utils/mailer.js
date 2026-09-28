@@ -3,79 +3,14 @@ const path = require("path");
 require("dotenv").config({ path: path.resolve(__dirname, "../../.env") });
 const nodemailer = require("nodemailer");
 
-let transporter = null;
-
-/**
- * Initializes and caches the Nodemailer SMTP Transporter
- */
-const getTransporter = () => {
-  if (transporter) return transporter;
-
-  const host = process.env.SMTP_HOST || process.env.EMAIL_HOST || "smtp-relay.brevo.com";
-  // Default to 2525 for cloud hosting compatibility (Render/AWS), fallback to 587
-  const port = parseInt(process.env.SMTP_PORT || process.env.EMAIL_PORT || "2525", 10);
-  const user = process.env.SMTP_USER || process.env.EMAIL_USER;
-  const pass = process.env.SMTP_PASS || process.env.EMAIL_PASS;
-  const isSecure = port === 465;
-
-  if (!user || !pass) {
-    console.error("⚠️ SMTP Warning: Credentials are not defined in environment variables.");
-  }
-
-  transporter = nodemailer.createTransport({
-    host,
-    port,
-    secure: isSecure, // true for 465, false for other ports (587, 2525)
-    auth: {
-      user,
-      pass,
-    },
-    tls: {
-      rejectUnauthorized: false,
-    },
-    connectionTimeout: 10000, // 10s connection timeout
-    greetingTimeout: 10000,   // 10s greeting timeout
-    socketTimeout: 15000,     // 15s socket timeout
-    pool: true,
-    maxConnections: 5,
-    maxMessages: 100,
-  });
-
-  return transporter;
-};
-
-/**
- * Non-blocking connection verification for production boot cycles
- */
-const verifyConnection = async () => {
-  try {
-    const transport = getTransporter();
-    await transport.verify();
-    return { success: true };
-  } catch (error) {
-    return { success: false, error: error.message };
-  }
-};
-
-// Safe startup check
-(async () => {
-  try {
-    const result = await verifyConnection();
-    if (result.success) {
-      console.log(`✅ Brevo SMTP Connection Verified for: ${process.env.EMAIL_FROM || "info.smilejobs@gmail.com"}`);
-    } else {
-      console.warn(`⚠️ Brevo SMTP handshake notice: ${result.error}`);
-    }
-  } catch (err) {
-    console.warn(`⚠️ Brevo SMTP init notice: ${err.message}`);
-  }
-})();
-
 const FROM_NAME = process.env.EMAIL_FROM_NAME || "Smile Jobs";
 const FROM_EMAIL = process.env.EMAIL_FROM || process.env.EMAIL_FROM_ADDRESS || "info.smilejobs@gmail.com";
 const REPLY_TO = process.env.EMAIL_REPLY_TO || FROM_EMAIL;
 const APP_NAME = process.env.APP_NAME || "Smile Jobs";
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+
+// Brevo API Key (starts with xkeysib- or fallback to SMTP_PASS)
+const BREVO_API_KEY = process.env.BREVO_API_KEY || process.env.SMTP_PASS;
 
 /**
  * Validates real email addresses and excludes internal mock handles
@@ -83,18 +18,89 @@ const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 const isValidDeliverableEmail = (email) => {
   if (!email || typeof email !== "string") return false;
   const clean = email.trim().toLowerCase();
-  if (clean.endsWith("@phone.verihire.local") || clean.includes("phone.local") || clean.includes("test.local")) return false;
+  if (
+    clean.endsWith("@phone.verihire.local") ||
+    clean.includes("phone.local") ||
+    clean.includes("test.local")
+  ) {
+    return false;
+  }
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   return emailRegex.test(clean);
 };
 
 /**
- * Send a single email
+ * Send email via Brevo HTTPS REST API (Port 443 - Never blocked on Render/Cloud)
  */
-const sendEmail = async ({ to, subject, html, text, attachments = [] }) => {
+const sendViaBrevoApi = async ({ to, subject, html, text, recipientName = "User" }) => {
+  const payload = {
+    sender: {
+      name: FROM_NAME,
+      email: FROM_EMAIL,
+    },
+    to: [
+      {
+        email: to.trim(),
+        name: recipientName,
+      },
+    ],
+    replyTo: {
+      email: REPLY_TO,
+      name: FROM_NAME,
+    },
+    subject: subject.trim(),
+    htmlContent: html,
+    textContent: text || html.replace(/<[^>]*>/g, ""),
+  };
+
+  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "api-key": BREVO_API_KEY,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data.message || `Brevo API Error (${response.status})`);
+  }
+
+  return { success: true, messageId: data.messageId };
+};
+
+/**
+ * Fallback to Nodemailer SMTP if API key is not present
+ */
+let transporter = null;
+const getTransporter = () => {
+  if (transporter) return transporter;
+  const host = process.env.SMTP_HOST || process.env.EMAIL_HOST || "smtp-relay.brevo.com";
+  const port = parseInt(process.env.SMTP_PORT || process.env.EMAIL_PORT || "587", 10);
+  const user = process.env.SMTP_USER || process.env.EMAIL_USER;
+  const pass = process.env.SMTP_PASS || process.env.EMAIL_PASS;
+
+  transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure: port === 465,
+    auth: { user, pass },
+    tls: { rejectUnauthorized: false },
+    connectionTimeout: 10000,
+  });
+  return transporter;
+};
+
+/**
+ * Send a single email (uses Brevo HTTPS API first, SMTP fallback)
+ */
+const sendEmail = async ({ to, subject, html, text, recipientName }) => {
   try {
     if (!to || !subject || !html) {
-      throw new Error("Missing required email field validation parameters (to, subject, html)");
+      throw new Error("Missing required email fields (to, subject, html)");
     }
 
     if (!isValidDeliverableEmail(to)) {
@@ -102,6 +108,14 @@ const sendEmail = async ({ to, subject, html, text, attachments = [] }) => {
       return { success: false, error: "Skipped: Not a deliverable address" };
     }
 
+    // Use Brevo HTTPS API if key is configured (Preferred for Render)
+    if (BREVO_API_KEY) {
+      const result = await sendViaBrevoApi({ to, subject, html, text, recipientName });
+      console.log(`📧 [Brevo HTTPS] Dispatch successful: ${to} | ID: ${result.messageId}`);
+      return result;
+    }
+
+    // SMTP Fallback
     const transport = getTransporter();
     const mailOptions = {
       from: `"${FROM_NAME}" <${FROM_EMAIL}>`,
@@ -110,27 +124,26 @@ const sendEmail = async ({ to, subject, html, text, attachments = [] }) => {
       subject: subject.trim(),
       html,
       text: text || html.replace(/<[^>]*>/g, ""),
-      attachments,
     };
 
     const info = await transport.sendMail(mailOptions);
-    console.log(`📧 Dispatch successful: ${to} | ID: ${info.messageId}`);
+    console.log(`📧 [SMTP] Dispatch successful: ${to} | ID: ${info.messageId}`);
     return { success: true, messageId: info.messageId };
   } catch (error) {
-    console.error(`❌ Dispatch execution failed to ${to}:`, error.message);
+    console.error(`❌ Dispatch failed to ${to}:`, error.message);
     return { success: false, error: error.message };
   }
 };
 
 /**
- * Send bulk emails in controlled batches
+ * Send bulk emails in batches
  */
 const sendBulkEmail = async (
   recipients,
   subject,
   htmlTemplate,
   batchSize = 10,
-  delayMs = 1500
+  delayMs = 500
 ) => {
   const results = {
     total: recipients.length,
@@ -178,6 +191,7 @@ const sendBulkEmail = async (
         to: email,
         subject,
         html: personalizedHtml,
+        recipientName: name,
       });
 
       if (result.success) {
@@ -201,6 +215,46 @@ const sendBulkEmail = async (
 
   return results;
 };
+
+/**
+ * Verify Connection
+ */
+const verifyConnection = async () => {
+  if (BREVO_API_KEY) {
+    try {
+      const res = await fetch("https://api.brevo.com/v3/account", {
+        headers: { "api-key": BREVO_API_KEY },
+      });
+      if (res.ok) {
+        const acc = await res.json();
+        console.log(`✅ Brevo HTTPS API Connected for account: ${acc.email}`);
+        return { success: true };
+      }
+      const errData = await res.json();
+      return { success: false, error: errData.message };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+
+  try {
+    const transport = getTransporter();
+    await transport.verify();
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+};
+
+// Startup verification
+(async () => {
+  const res = await verifyConnection();
+  if (res.success) {
+    console.log(`✅ Email Delivery Ready (Smile Jobs) — ${FROM_EMAIL}`);
+  } else {
+    console.warn(`⚠️ Mailer startup notice: ${res.error}`);
+  }
+})();
 
 /**
  * Branded HTML layout wrapper
@@ -247,7 +301,7 @@ const wrapEmailTemplate = (content, options = {}) => {
               ${footerNote ? `<p style="margin:0 0 8px;font-size:12px;color:#666;">${footerNote}</p>` : ""}
               <p style="margin:0;font-size:11px;color:#999;">
                 © ${new Date().getFullYear()} ${APP_NAME}. All rights reserved.<br>
-                For support inquiries, contact: <a href="mailto:${REPLY_TO}" style="color:#4F46E5;text-decoration:none;">${REPLY_TO}</a>
+                Contact: <a href="mailto:${REPLY_TO}" style="color:#4F46E5;text-decoration:none;">${REPLY_TO}</a>
               </p>
             </td>
           </tr>
