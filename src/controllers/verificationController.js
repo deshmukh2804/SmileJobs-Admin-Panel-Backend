@@ -134,10 +134,51 @@ const buildClarificationEmail = (recruiterName, companyName, message, docs) => `
   <p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:16px;">© ${new Date().getFullYear()} ${APP_NAME}. All rights reserved.</p>
 </div>`;
 
-// ─── DATA TRANSFORMERS ────────────────────────────────────────
-const transformToListItem = (v) => {
+// ─── HELPER: Detect file format from URL or docName ───────────
+const detectFormatFromUrl = (url = "", docName = "") => {
+  const source = `${url} ${docName}`.toLowerCase();
+  if (source.match(/\.(pdf)(\?|$|\/)/)) return "pdf";
+  if (source.match(/\.(png)(\?|$|\/)/)) return "png";
+  if (source.match(/\.(jpg|jpeg)(\?|$|\/)/)) return "jpg";
+  if (source.match(/\.(webp)(\?|$|\/)/)) return "webp";
+  if (source.match(/\.(gif)(\?|$|\/)/)) return "gif";
+  if (source.match(/\.(doc|docx)(\?|$|\/)/)) return "doc";
+  return "";
+};
+
+// ─── HELPER: Enrich Verification with Recruiter Profile ───────
+const enrichVerificationRecord = async (v) => {
+  const record = v.toObject ? v.toObject() : v;
+
+  let recruiter = null;
+  if (record.recruiterId) {
+    try {
+      recruiter = await RecruiterProfile.findById(record.recruiterId).lean();
+    } catch (err) {
+      console.warn("Recruiter profile lookup failed:", err.message);
+    }
+  }
+
+  // If verification companyName is empty, use recruiter's data
   const companyName =
-    v.companyName || v.companySnapshot?.name || "Unnamed Company";
+    record.companyName ||
+    record.companySnapshot?.name ||
+    recruiter?.companyProfile?.name ||
+    recruiter?.companyName ||
+    "Unnamed Company";
+
+  return { record, recruiter, companyName };
+};
+
+// ─── DATA TRANSFORMERS ────────────────────────────────────────
+const transformToListItem = (v, recruiter = null) => {
+  const companyName =
+    v.companyName ||
+    v.companySnapshot?.name ||
+    recruiter?.companyProfile?.name ||
+    recruiter?.companyName ||
+    "Unnamed Company";
+
   const submittedAt = v.submittedAt || v.createdAt;
 
   return {
@@ -149,8 +190,8 @@ const transformToListItem = (v) => {
     priority: v.status === "pending" ? "High Priority" : "Normal Priority",
     submittedTime: timeAgo(submittedAt),
     submittedAtRaw: submittedAt,
-    representativeName: v.recruiterName || "—",
-    representativeEmail: v.recruiterEmail || "",
+    representativeName: v.recruiterName || recruiter?.name || "—",
+    representativeEmail: v.recruiterEmail || recruiter?.email || "",
     status: v.status,
     reviewedBy: v.reviewedBy || "",
     reviewedAt: v.reviewedAt,
@@ -171,6 +212,7 @@ const transformToListItem = (v) => {
 /**
  * GET /api/v1/verifications
  * List verifications with filters, search, pagination
+ * IMPORTANT: Excludes "not_submitted" by default (only admin-actionable records)
  */
 const getVerifications = async (req, res) => {
   try {
@@ -180,21 +222,32 @@ const getVerifications = async (req, res) => {
       page = 1,
       limit = 20,
       sort = "oldest",
+      includeNotSubmitted = "false",
     } = req.query;
 
     const filter = {};
-    if (status && status !== "all") filter.status = status;
+
+    if (status && status !== "all") {
+      filter.status = status;
+    } else if (includeNotSubmitted !== "true") {
+      // Exclude not_submitted from "all" view by default
+      filter.status = { $ne: "not_submitted" };
+    }
 
     if (search && search.trim()) {
       const regex = new RegExp(
         search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
         "i"
       );
-      filter.$or = [
+      const searchOr = [
         { companyName: regex },
         { recruiterName: regex },
         { recruiterEmail: regex },
+        { "companySnapshot.name": regex },
       ];
+
+      if (filter.$or) filter.$and = [{ $or: filter.$or }, { $or: searchOr }];
+      else filter.$or = searchOr;
     }
 
     const pageNum = Math.max(parseInt(page, 10) || 1, 1);
@@ -202,7 +255,9 @@ const getVerifications = async (req, res) => {
     const skip = (pageNum - 1) * limitNum;
 
     const sortObj =
-      sort === "newest" ? { submittedAt: -1 } : { submittedAt: 1 };
+      sort === "newest"
+        ? { submittedAt: -1, createdAt: -1 }
+        : { submittedAt: 1, createdAt: 1 };
 
     const [items, total, counts] = await Promise.all([
       Verification.find(filter)
@@ -216,7 +271,30 @@ const getVerifications = async (req, res) => {
       ]),
     ]);
 
+    // Enrich each item with recruiter data if companyName is blank
+    const recruiterIds = items
+      .filter((i) => !i.companyName && i.recruiterId)
+      .map((i) => i.recruiterId);
+
+    let recruitersMap = new Map();
+    if (recruiterIds.length > 0) {
+      try {
+        const recruiters = await RecruiterProfile.find({
+          _id: { $in: recruiterIds },
+        }).lean();
+        recruitersMap = new Map(recruiters.map((r) => [String(r._id), r]));
+      } catch (err) {
+        console.warn("Recruiter enrichment failed:", err.message);
+      }
+    }
+
+    const transformed = items.map((item) => {
+      const recruiter = recruitersMap.get(String(item.recruiterId)) || null;
+      return transformToListItem(item, recruiter);
+    });
+
     const statusCounts = {
+      not_submitted: 0,
       pending: 0,
       under_review: 0,
       approved: 0,
@@ -226,12 +304,14 @@ const getVerifications = async (req, res) => {
     };
     counts.forEach((c) => {
       statusCounts[c._id] = c.count;
-      statusCounts.total += c.count;
+      if (c._id !== "not_submitted") {
+        statusCounts.total += c.count;
+      }
     });
 
     return res.status(200).json({
       success: true,
-      data: items.map(transformToListItem),
+      data: transformed,
       pagination: {
         page: pageNum,
         limit: limitNum,
@@ -244,7 +324,7 @@ const getVerifications = async (req, res) => {
     console.error("Get Verifications Error:", error);
     return res.status(500).json({
       success: false,
-      message: "Failed to fetch verifications",
+      message: "Failed to fetch verifications: " + error.message,
     });
   }
 };
@@ -262,18 +342,25 @@ const getVerificationById = async (req, res) => {
         .json({ success: false, message: "Verification request not found" });
     }
 
-    // Fetch full recruiter profile from recruiter_db
+    // Fetch full recruiter profile
     let recruiter = null;
     if (verification.recruiterId) {
-      recruiter = await RecruiterProfile.findById(
-        verification.recruiterId
-      ).lean();
+      try {
+        recruiter = await RecruiterProfile.findById(
+          verification.recruiterId
+        ).lean();
+      } catch (err) {
+        console.warn("Recruiter lookup failed:", err.message);
+      }
     }
 
     const companyName =
       verification.companyName ||
       verification.companySnapshot?.name ||
+      recruiter?.companyProfile?.name ||
+      recruiter?.companyName ||
       "Unnamed";
+
     const submittedAt = verification.submittedAt || verification.createdAt;
 
     const detail = {
@@ -297,51 +384,79 @@ const getVerificationById = async (req, res) => {
         industry:
           verification.companySnapshot?.industry ||
           recruiter?.companyProfile?.industry ||
+          recruiter?.industry ||
           "",
         website:
           verification.companySnapshot?.website ||
           recruiter?.companyProfile?.website ||
+          recruiter?.website ||
           "",
-        linkedIn: recruiter?.companyProfile?.linkedInUrl || "",
-        about: recruiter?.companyProfile?.about || "",
-        tagline: recruiter?.companyProfile?.tagline || "",
+        linkedIn:
+          recruiter?.companyProfile?.linkedInUrl ||
+          recruiter?.linkedInUrl ||
+          "",
+        about:
+          verification.companySnapshot?.about ||
+          recruiter?.companyProfile?.about ||
+          recruiter?.about ||
+          "",
+        tagline:
+          recruiter?.companyProfile?.tagline || recruiter?.tagline || "",
         logoUrl:
           verification.companySnapshot?.logoUrl ||
           recruiter?.companyProfile?.logo?.url ||
+          recruiter?.companyLogo?.url ||
           "",
         city:
           verification.companySnapshot?.city ||
           recruiter?.companyProfile?.city ||
+          recruiter?.city ||
           "",
         state:
           verification.companySnapshot?.state ||
           recruiter?.companyProfile?.state ||
+          recruiter?.state ||
           "",
         country:
           verification.companySnapshot?.country ||
           recruiter?.companyProfile?.country ||
+          recruiter?.country ||
+          "India",
+        address:
+          recruiter?.companyProfile?.address || recruiter?.address || "",
+        headquarters:
+          recruiter?.companyProfile?.headquarters ||
+          recruiter?.headquarters ||
           "",
-        address: recruiter?.companyProfile?.address || "",
-        headquarters: recruiter?.companyProfile?.headquarters || "",
         registrationNumber:
           verification.companySnapshot?.registrationNumber ||
           recruiter?.companyProfile?.registrationNumber ||
+          recruiter?.registrationNumber ||
           "",
         gstNumber:
           verification.companySnapshot?.gstNumber ||
           recruiter?.companyProfile?.gstNumber ||
+          recruiter?.gstNumber ||
           "",
         panNumber:
           verification.companySnapshot?.panNumber ||
           recruiter?.companyProfile?.panNumber ||
+          recruiter?.panNumber ||
           "",
         foundedYear:
+          verification.companySnapshot?.establishedYear ||
           recruiter?.companyProfile?.foundedYear ||
           recruiter?.companyProfile?.establishedYear ||
+          recruiter?.foundedYear ||
           "",
-        teamSize: recruiter?.companyProfile?.teamSize || "",
-        organizationSize: recruiter?.companyProfile?.organizationSize || "",
-        perks: recruiter?.companyProfile?.perks || [],
+        teamSize:
+          recruiter?.companyProfile?.teamSize || recruiter?.teamSize || "",
+        organizationSize:
+          verification.companySnapshot?.organizationSize ||
+          recruiter?.companyProfile?.organizationSize ||
+          recruiter?.organizationSize ||
+          "",
+        perks: recruiter?.companyProfile?.perks || recruiter?.perks || [],
       },
 
       // Recruiter info
@@ -349,39 +464,96 @@ const getVerificationById = async (req, res) => {
         id: verification.recruiterId
           ? String(verification.recruiterId)
           : null,
-        name: verification.recruiterName || recruiter?.name || "",
+        name:
+          verification.recruiterName ||
+          recruiter?.name ||
+          recruiter?.fullName ||
+          "",
         email: verification.recruiterEmail || recruiter?.email || "",
-        avatar: recruiter?.avatar?.url || "",
+        phone:
+          verification.recruiterPhone ||
+          recruiter?.phone ||
+          recruiter?.mobileNumber ||
+          "",
+        avatar: recruiter?.avatar?.url || recruiter?.profilePicture?.url || "",
         designation: recruiter?.designation || "",
         loginMethod: recruiter?.loginMethod || "email",
         role: recruiter?.role || "recruiter",
         isActive: recruiter?.isActive ?? true,
         isVerified: recruiter?.isVerified ?? false,
-        verificationStatus: recruiter?.verificationStatus || "pending",
+        verificationStatus:
+          recruiter?.verificationStatus || verification.status || "pending",
         lastLogin: recruiter?.lastLogin || null,
-        contactPerson: recruiter?.companyProfile?.contactPerson || {},
-        contactEmail: recruiter?.companyProfile?.contactEmail || "",
-        contactPhone: recruiter?.companyProfile?.contactPhone || "",
-        whatsappNumber: recruiter?.companyProfile?.whatsappNumber || "",
+        contactPerson:
+          recruiter?.companyProfile?.contactPerson ||
+          {
+            name:
+              verification.companySnapshot?.contactPersonName ||
+              recruiter?.name ||
+              "",
+            designation:
+              verification.companySnapshot?.contactPersonDesignation ||
+              recruiter?.designation ||
+              "",
+          },
+        contactEmail:
+          verification.companySnapshot?.contactEmail ||
+          recruiter?.companyProfile?.contactEmail ||
+          recruiter?.email ||
+          "",
+        contactPhone:
+          verification.companySnapshot?.contactPhone ||
+          recruiter?.companyProfile?.contactPhone ||
+          recruiter?.phone ||
+          "",
+        whatsappNumber:
+          recruiter?.companyProfile?.whatsappNumber ||
+          recruiter?.whatsappNumber ||
+          "",
       },
 
-      // Documents
-      documents: (verification.documents || []).map((d) => ({
-        id: String(d._id),
-        docType: d.docType,
-        docTypeLabel: DOC_TYPE_LABELS[d.docType] || d.docType,
-        docName: d.docName,
-        url: d.url,
-        publicId: d.public_id,
-        format: d.format || "png",
-        size: d.size || 0,
-        sizeFormatted: d.size ? `${(d.size / 1024).toFixed(1)} KB` : "—",
-        uploadedAt: d.uploadedAt,
-        uploadedTime: timeAgo(d.uploadedAt),
-        isImage: ["png", "jpg", "jpeg", "webp", "gif"].includes(
-          (d.format || "").toLowerCase()
-        ),
-      })),
+      // Documents — supports PDF, images, docs
+      documents: (verification.documents || []).map((d) => {
+        const detectedFormat = (d.format || "").toLowerCase();
+        const finalFormat =
+          detectedFormat || detectFormatFromUrl(d.url, d.docName) || "png";
+        const isPdf = finalFormat === "pdf";
+        const isImage = ["png", "jpg", "jpeg", "webp", "gif", "bmp"].includes(
+          finalFormat
+        );
+        const isDoc = ["doc", "docx", "xls", "xlsx", "ppt", "pptx"].includes(
+          finalFormat
+        );
+
+        // Cloudinary raw PDFs — ensure the URL works for iframe embedding
+        let viewableUrl = d.url;
+        if (isPdf && d.url && d.url.includes("cloudinary.com")) {
+          // If Cloudinary stored it as raw/authenticated, keep as-is
+          viewableUrl = d.url;
+        }
+
+        return {
+          id: String(d._id),
+          docType: d.docType,
+          docTypeLabel: DOC_TYPE_LABELS[d.docType] || d.docType,
+          docName: d.docName,
+          url: viewableUrl,
+          downloadUrl: d.url,
+          publicId: d.public_id,
+          format: finalFormat,
+          size: d.size || 0,
+          sizeFormatted: d.size
+            ? d.size > 1024 * 1024
+              ? `${(d.size / (1024 * 1024)).toFixed(2)} MB`
+              : `${(d.size / 1024).toFixed(1)} KB`
+            : "—",
+          uploadedAt: d.uploadedAt,
+          uploadedTime: timeAgo(d.uploadedAt),
+          isImage,
+          isPdf,
+          isDoc,
+        };
+      }),
     };
 
     return res.status(200).json({ success: true, data: detail });
@@ -389,7 +561,7 @@ const getVerificationById = async (req, res) => {
     console.error("Get Verification Detail Error:", error);
     return res.status(500).json({
       success: false,
-      message: "Failed to fetch verification detail",
+      message: "Failed to fetch verification detail: " + error.message,
     });
   }
 };
@@ -426,32 +598,44 @@ const approveVerification = async (req, res) => {
 
     // Sync recruiter profile
     if (verification.recruiterId) {
-      await RecruiterProfile.findByIdAndUpdate(
-        verification.recruiterId,
-        {
-          $set: {
-            verificationStatus: "approved",
-            isVerified: true,
-            verificationReviewedAt: new Date(),
-            reviewedBy: verification.reviewedBy,
-            rejectionReason: "",
+      try {
+        await RecruiterProfile.findByIdAndUpdate(
+          verification.recruiterId,
+          {
+            $set: {
+              verificationStatus: "approved",
+              isVerified: true,
+              verificationReviewedAt: new Date(),
+              reviewedBy: verification.reviewedBy,
+              rejectionReason: "",
+            },
           },
-        },
-        { new: true }
-      );
+          { new: true }
+        );
+      } catch (syncErr) {
+        console.warn("Recruiter sync warning:", syncErr.message);
+      }
     }
 
-    // Email recruiter via Brevo SMTP
+    // Email recruiter
     if (verification.recruiterEmail) {
       try {
-        await sendEmail({
+        const emailResult = await sendEmail({
           to: verification.recruiterEmail,
-          subject: `✓ ${verification.companyName} — Verification Approved | ${APP_NAME}`,
+          subject: `✓ ${verification.companyName || "Your Company"} — Verification Approved | ${APP_NAME}`,
           html: buildApprovalEmail(
             verification.recruiterName || "there",
-            verification.companyName
+            verification.companyName || "Your Company"
           ),
+          recipientName: verification.recruiterName || "Recruiter",
         });
+        if (emailResult.success) {
+          console.log(
+            `📧 Approval email delivered to ${verification.recruiterEmail}`
+          );
+        } else {
+          console.warn(`⚠️ Approval email skipped: ${emailResult.error}`);
+        }
       } catch (mailErr) {
         console.error("Approval email failed:", mailErr.message);
       }
@@ -515,29 +699,41 @@ const rejectVerification = async (req, res) => {
 
     // Sync recruiter profile
     if (verification.recruiterId) {
-      await RecruiterProfile.findByIdAndUpdate(verification.recruiterId, {
-        $set: {
-          verificationStatus: "rejected",
-          isVerified: false,
-          verificationReviewedAt: new Date(),
-          reviewedBy: verification.reviewedBy,
-          rejectionReason: reason.trim(),
-        },
-      });
+      try {
+        await RecruiterProfile.findByIdAndUpdate(verification.recruiterId, {
+          $set: {
+            verificationStatus: "rejected",
+            isVerified: false,
+            verificationReviewedAt: new Date(),
+            reviewedBy: verification.reviewedBy,
+            rejectionReason: reason.trim(),
+          },
+        });
+      } catch (syncErr) {
+        console.warn("Recruiter sync warning:", syncErr.message);
+      }
     }
 
-    // Email recruiter via Brevo SMTP
+    // Email recruiter
     if (verification.recruiterEmail) {
       try {
-        await sendEmail({
+        const emailResult = await sendEmail({
           to: verification.recruiterEmail,
-          subject: `Verification Update — ${verification.companyName} | ${APP_NAME}`,
+          subject: `Verification Update — ${verification.companyName || "Your Company"} | ${APP_NAME}`,
           html: buildRejectionEmail(
             verification.recruiterName || "there",
-            verification.companyName,
+            verification.companyName || "Your Company",
             reason
           ),
+          recipientName: verification.recruiterName || "Recruiter",
         });
+        if (emailResult.success) {
+          console.log(
+            `📧 Rejection email delivered to ${verification.recruiterEmail}`
+          );
+        } else {
+          console.warn(`⚠️ Rejection email skipped: ${emailResult.error}`);
+        }
       } catch (mailErr) {
         console.error("Rejection email failed:", mailErr.message);
       }
@@ -570,7 +766,6 @@ const rejectVerification = async (req, res) => {
 
 /**
  * PATCH /api/v1/verifications/:id/request-clarification
- * Ask recruiter to re-upload specified documents
  */
 const requestClarification = async (req, res) => {
   try {
@@ -600,29 +795,41 @@ const requestClarification = async (req, res) => {
 
     // Sync recruiter profile
     if (verification.recruiterId) {
-      await RecruiterProfile.findByIdAndUpdate(verification.recruiterId, {
-        $set: {
-          verificationStatus: "clarification_requested",
-          isVerified: false,
-          verificationReviewedAt: new Date(),
-          reviewedBy: verification.reviewedBy,
-        },
-      });
+      try {
+        await RecruiterProfile.findByIdAndUpdate(verification.recruiterId, {
+          $set: {
+            verificationStatus: "clarification_requested",
+            isVerified: false,
+            verificationReviewedAt: new Date(),
+            reviewedBy: verification.reviewedBy,
+          },
+        });
+      } catch (syncErr) {
+        console.warn("Recruiter sync warning:", syncErr.message);
+      }
     }
 
-    // Email recruiter via Brevo SMTP
+    // Email recruiter
     if (verification.recruiterEmail) {
       try {
-        await sendEmail({
+        const emailResult = await sendEmail({
           to: verification.recruiterEmail,
-          subject: `Action Required — Re-upload Documents for ${verification.companyName} | ${APP_NAME}`,
+          subject: `Action Required — Re-upload Documents for ${verification.companyName || "Your Company"} | ${APP_NAME}`,
           html: buildClarificationEmail(
             verification.recruiterName || "there",
-            verification.companyName,
+            verification.companyName || "Your Company",
             message,
             docs
           ),
+          recipientName: verification.recruiterName || "Recruiter",
         });
+        if (emailResult.success) {
+          console.log(
+            `📧 Clarification email delivered to ${verification.recruiterEmail}`
+          );
+        } else {
+          console.warn(`⚠️ Clarification email skipped: ${emailResult.error}`);
+        }
       } catch (mailErr) {
         console.error("Clarification email failed:", mailErr.message);
       }
@@ -674,13 +881,16 @@ const getStats = async (req, res) => {
     ]);
 
     const stats = {
+      not_submitted: 0,
       pending: 0,
       under_review: 0,
       approved: 0,
       rejected: 0,
       clarification_requested: 0,
     };
-    statusAgg.forEach((s) => (stats[s._id] = s.count));
+    statusAgg.forEach((s) => {
+      stats[s._id] = s.count;
+    });
 
     return res.status(200).json({
       success: true,

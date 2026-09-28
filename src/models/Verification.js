@@ -32,6 +32,7 @@ const companySnapshotSchema = new mongoose.Schema(
     name: { type: String, default: "" },
     industry: { type: String, default: "" },
     website: { type: String, default: "" },
+    about: { type: String, default: "" },
     city: { type: String, default: "" },
     state: { type: String, default: "" },
     country: { type: String, default: "" },
@@ -39,6 +40,12 @@ const companySnapshotSchema = new mongoose.Schema(
     gstNumber: { type: String, default: "" },
     panNumber: { type: String, default: "" },
     logoUrl: { type: String, default: "" },
+    contactEmail: { type: String, default: "" },
+    contactPhone: { type: String, default: "" },
+    contactPersonName: { type: String, default: "" },
+    contactPersonDesignation: { type: String, default: "" },
+    organizationSize: { type: String, default: "" },
+    establishedYear: { type: Number, default: null },
   },
   { _id: false }
 );
@@ -52,18 +59,26 @@ const verificationSchema = new mongoose.Schema(
     },
     recruiterName: { type: String, default: "" },
     recruiterEmail: { type: String, default: "" },
+    recruiterPhone: { type: String, default: "" },
     companyName: { type: String, default: "" },
 
     companySnapshot: { type: companySnapshotSchema, default: () => ({}) },
 
     status: {
       type: String,
-      enum: ["pending", "under_review", "approved", "rejected", "clarification_requested"],
+      enum: [
+        "not_submitted",
+        "pending",
+        "under_review",
+        "approved",
+        "rejected",
+        "clarification_requested",
+      ],
       default: "pending",
       index: true,
     },
 
-    submittedAt: { type: Date, default: Date.now },
+    submittedAt: { type: Date, default: null },
     reviewedAt: { type: Date, default: null },
     reviewedBy: { type: String, default: "" },
 
@@ -76,10 +91,16 @@ const verificationSchema = new mongoose.Schema(
 
     documents: [documentSchema],
   },
-  { timestamps: true, collection: "verifications" }
+  { timestamps: true, collection: "verifications", strict: false }
 );
 
 verificationSchema.index({ status: 1, submittedAt: -1 });
-verificationSchema.index({ companyName: "text", recruiterName: "text", recruiterEmail: "text" });
+verificationSchema.index({
+  companyName: "text",
+  recruiterName: "text",
+  recruiterEmail: "text",
+});
 
-module.exports = recruiterDbConnection.model("Verification", verificationSchema);
+module.exports =
+  recruiterDbConnection.models.Verification ||
+  recruiterDbConnection.model("Verification", verificationSchema);
