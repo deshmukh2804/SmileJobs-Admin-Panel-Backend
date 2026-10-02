@@ -685,29 +685,145 @@ const updateJob = async (req, res) => {
   }
 };
 
-// @desc    Delete a job
+// ═══════════════════════════════════════════════════════════════
+// @desc    Delete a job (SAFE — protects shared Cloudinary assets)
+// @route   DELETE /api/v1/jobs/:id
+// ═══════════════════════════════════════════════════════════════
 const deleteJob = async (req, res) => {
   try {
     const job = await Job.findById(req.params.id);
-    if (!job) return res.status(404).json({ success: false, message: "Job not found" });
+    if (!job) {
+      return res.status(404).json({ success: false, message: "Job not found" });
+    }
 
     if (!canManageJob(req, job)) {
       return res.status(403).json({ success: false, message: "Not authorized to delete this job" });
     }
 
+    // ─── Step 1: Collect all Cloudinary publicIds from THIS job ───
+    const jobAssetPublicIds = [];
     if (job.companyLogo?.publicId) {
-      await deleteFromCloudinary(job.companyLogo.publicId).catch(() => {});
+      jobAssetPublicIds.push(job.companyLogo.publicId);
     }
-    if (job.companyImages?.length > 0) {
-      await deleteMultipleFromCloudinary(job.companyImages.map((i) => i.publicId)).catch(() => {});
+    if (Array.isArray(job.companyImages)) {
+      job.companyImages.forEach((img) => {
+        if (img.publicId) jobAssetPublicIds.push(img.publicId);
+      });
     }
 
+    // ─── Step 2: Find which assets are shared with OTHER jobs ───
+    const sharedPublicIds = new Set();
+
+    if (jobAssetPublicIds.length > 0) {
+      try {
+        const otherJobsUsingAssets = await Job.find({
+          _id: { $ne: job._id },
+          $or: [
+            { "companyLogo.publicId": { $in: jobAssetPublicIds } },
+            { "companyImages.publicId": { $in: jobAssetPublicIds } },
+          ],
+        }).select("companyLogo companyImages");
+
+        otherJobsUsingAssets.forEach((otherJob) => {
+          if (otherJob.companyLogo?.publicId && jobAssetPublicIds.includes(otherJob.companyLogo.publicId)) {
+            sharedPublicIds.add(otherJob.companyLogo.publicId);
+          }
+          if (Array.isArray(otherJob.companyImages)) {
+            otherJob.companyImages.forEach((img) => {
+              if (img.publicId && jobAssetPublicIds.includes(img.publicId)) {
+                sharedPublicIds.add(img.publicId);
+              }
+            });
+          }
+        });
+      } catch (shareErr) {
+        console.warn(`⚠️ Could not check shared assets across jobs: ${shareErr.message}`);
+      }
+    }
+
+    // ─── Step 3: Check recruiter's profile for shared assets ───
+    try {
+      if (job.recruiterId) {
+        const recruiter = await Recruiter.findById(job.recruiterId)
+          .select("companyProfile companyLogo companyImages")
+          .lean();
+
+        if (recruiter) {
+          // Check recruiter profile logo (multiple possible field locations)
+          const profileLogoId =
+            recruiter.companyProfile?.logo?.publicId ||
+            recruiter.companyLogo?.publicId;
+          if (profileLogoId && jobAssetPublicIds.includes(profileLogoId)) {
+            sharedPublicIds.add(profileLogoId);
+          }
+
+          // Check recruiter profile gallery
+          const profileGallery =
+            recruiter.companyProfile?.gallery ||
+            recruiter.companyImages ||
+            [];
+          if (Array.isArray(profileGallery)) {
+            profileGallery.forEach((g) => {
+              if (g.publicId && jobAssetPublicIds.includes(g.publicId)) {
+                sharedPublicIds.add(g.publicId);
+              }
+            });
+          }
+        }
+      }
+    } catch (recruiterErr) {
+      // Non-fatal: if recruiter lookup fails, proceed with caution
+      console.warn(
+        `⚠️ Could not check recruiter profile for shared assets: ${recruiterErr.message}`
+      );
+    }
+
+    // ─── Step 4: Delete ONLY non-shared assets from Cloudinary ───
+    const deletedAssets = [];
+    const skippedAssets = [];
+
+    for (const publicId of jobAssetPublicIds) {
+      if (sharedPublicIds.has(publicId)) {
+        console.log(
+          `ℹ️ Skipping shared asset deletion (used by other jobs/profile): [${publicId}]`
+        );
+        skippedAssets.push(publicId);
+        continue;
+      }
+
+      try {
+        await deleteFromCloudinary(publicId);
+        deletedAssets.push(publicId);
+        console.log(`✅ Deleted Cloudinary asset: [${publicId}]`);
+      } catch (cloudErr) {
+        // Non-fatal: log but don't block DB deletion
+        console.warn(
+          `⚠️ Cloudinary deletion failed for [${publicId}]: ${cloudErr.message}`
+        );
+      }
+    }
+
+    // ─── Step 5: Delete the job document from MongoDB ───
     await Job.findByIdAndDelete(req.params.id);
 
-    res.status(200).json({ success: true, message: "Job deleted successfully" });
+    console.log(
+      `🗑️ Job deleted: "${job.title}" [${job._id}] | Assets deleted: ${deletedAssets.length}, Skipped (shared): ${skippedAssets.length}`
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "Job deleted successfully",
+      data: {
+        deletedAssets: deletedAssets.length,
+        skippedSharedAssets: skippedAssets.length,
+      },
+    });
   } catch (error) {
     console.error("Delete Job Error:", error.message);
-    res.status(500).json({ success: false, message: "Server error while deleting job" });
+    res.status(500).json({
+      success: false,
+      message: "Server error while deleting job",
+    });
   }
 };
 

@@ -142,6 +142,8 @@ app.use("/api/v1/promotional-emails", promoEmailRoutes);
 app.use("/api/v1/user-management", userManagementRoutes);
 app.use("/api/v1/applications", applicationRoutes);
 app.use("/api/v1/dashboard", dashboardRoutes);
+// Register the route
+app.use("/api/v1/payments-and-billing", require("./routes/billingRoutes"));
 
 // Root alias support
 app.use("/jobs", jobRoutes);
