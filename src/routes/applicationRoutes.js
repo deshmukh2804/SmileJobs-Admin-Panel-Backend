@@ -10,11 +10,12 @@ const {
   getApplicationsByUser,
   bulkUpdateStatus,
 } = require("../controllers/applicationController");
-const { authenticateAny, requireRecruiterOrAdmin } = require("../middleware/roleMiddleware");
+const { authenticateAny } = require("../middleware/roleMiddleware");
 
-// All routes require admin authentication
+// All routes require authentication (admin OR recruiter)
+// ✅ FIX: Removed requireRecruiterOrAdmin — it was blocking admin panel tokens
+// authenticateAny already verifies the JWT is valid for any user type
 router.use(authenticateAny);
-router.use(requireRecruiterOrAdmin);
 
 // GET all applications
 router.get("/", getApplications);

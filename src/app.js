@@ -33,8 +33,8 @@ const app = express();
 // ═══════════════════════════════════════════════════════════════
 app.use(
   helmet({
-    contentSecurityPolicy: false, // Disables CSP header blockages
-    frameguard: false,            // ⚡ IMPORTANT: Disables X-Frame-Options SAMEORIGIN so iframe can load
+    contentSecurityPolicy: false,
+    frameguard: false,
     crossOriginResourcePolicy: { policy: "cross-origin" },
   })
 );
@@ -142,7 +142,6 @@ app.use("/api/v1/promotional-emails", promoEmailRoutes);
 app.use("/api/v1/user-management", userManagementRoutes);
 app.use("/api/v1/applications", applicationRoutes);
 app.use("/api/v1/dashboard", dashboardRoutes);
-// Register the route
 app.use("/api/v1/payments-and-billing", require("./routes/billingRoutes"));
 
 // Root alias support
