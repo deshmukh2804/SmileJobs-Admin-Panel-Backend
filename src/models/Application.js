@@ -97,4 +97,46 @@ const applicationSchema = new mongoose.Schema(
 applicationSchema.index({ jobId: 1, userId: 1 }, { unique: true });
 applicationSchema.index({ status: 1, appliedAt: -1 });
 
-module.exports = mongoose.model("Application", applicationSchema);
+// ═══════════════════════════════════════════════════════════════
+// DYNAMIC MULTI-CONNECTION ROUTER
+// Automatically locates the connection pointing to "Job_db"
+// ═══════════════════════════════════════════════════════════════
+const getApplicationModel = () => {
+  // Find the database connection that connects to "Job_db"
+  const targetConn = mongoose.connections.find(
+    (conn) => conn.name && conn.name.toLowerCase() === "job_db"
+  );
+
+  if (targetConn) {
+    // Return existing model if it's already compiled on this connection
+    if (targetConn.models["Application"]) {
+      return targetConn.models["Application"];
+    }
+    // Compile the model on the "Job_db" connection
+    return targetConn.model("Application", applicationSchema);
+  }
+
+  // Fallback to primary default connection
+  if (mongoose.models["Application"]) {
+    return mongoose.models["Application"];
+  }
+  return mongoose.model("Application", applicationSchema);
+};
+
+// Export a Proxy that intercepts calls and routes them to the correct connection
+const ApplicationProxy = new Proxy({}, {
+  get(target, prop) {
+    const model = getApplicationModel();
+    const value = model[prop];
+    if (typeof value === "function") {
+      return value.bind(model);
+    }
+    return value;
+  },
+  construct(target, args) {
+    const Model = getApplicationModel();
+    return new Model(...args);
+  }
+});
+
+module.exports = ApplicationProxy;
