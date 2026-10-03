@@ -98,33 +98,104 @@ applicationSchema.index({ jobId: 1, userId: 1 }, { unique: true });
 applicationSchema.index({ status: 1, appliedAt: -1 });
 
 // ═══════════════════════════════════════════════════════════════
-// DYNAMIC MULTI-CONNECTION ROUTER
-// Automatically locates the connection pointing to "Job_db"
+// DEDICATED CONNECTION TO application_db
+// This creates (or reuses) a separate MongoDB connection pointing
+// specifically to the "application_db" database where the 13
+// real applications live under the "applications" collection.
 // ═══════════════════════════════════════════════════════════════
-const getApplicationModel = () => {
-  // Find the database connection that connects to "Job_db"
-  const targetConn = mongoose.connections.find(
-    (conn) => conn.name && conn.name.toLowerCase() === "job_db"
+let applicationConnection = null;
+
+const getApplicationConnection = () => {
+  if (applicationConnection && applicationConnection.readyState === 1) {
+    return applicationConnection;
+  }
+
+  // Check if a connection to application_db already exists
+  const existingConn = mongoose.connections.find(
+    (conn) => conn.name && conn.name.toLowerCase() === "application_db"
   );
 
-  if (targetConn) {
-    // Return existing model if it's already compiled on this connection
-    if (targetConn.models["Application"]) {
-      return targetConn.models["Application"];
-    }
-    // Compile the model on the "Job_db" connection
-    return targetConn.model("Application", applicationSchema);
+  if (existingConn && existingConn.readyState === 1) {
+    applicationConnection = existingConn;
+    return applicationConnection;
   }
 
-  // Fallback to primary default connection
-  if (mongoose.models["Application"]) {
-    return mongoose.models["Application"];
+  // Build URI for application_db from env
+  const baseUri =
+    process.env.MONGO_URI_APPLICATION ||
+    process.env.MONGO_URI_JOBS ||
+    process.env.MONGO_URI ||
+    process.env.MONGODB_URI;
+
+  if (!baseUri) {
+    console.error(
+      "❌ No MongoDB URI found in env for application_db. Set MONGO_URI_APPLICATION."
+    );
+    return null;
   }
-  return mongoose.model("Application", applicationSchema);
+
+  // Replace the db name in the URI with "application_db"
+  let appUri = baseUri;
+  try {
+    // Replace existing database name in URI with application_db
+    const parsed = new URL(baseUri);
+    // Extract the path (e.g. /careerflow_admin?retryWrites=true)
+    const pathParts = parsed.pathname.split("?");
+    parsed.pathname = "/application_db";
+    // Preserve query string
+    if (baseUri.includes("?")) {
+      const queryStart = baseUri.indexOf("?");
+      appUri = `${baseUri.substring(0, baseUri.lastIndexOf("/"))}/application_db${baseUri.substring(queryStart)}`;
+    } else {
+      appUri = `${baseUri.substring(0, baseUri.lastIndexOf("/"))}/application_db`;
+    }
+  } catch (e) {
+    // Fallback simple replace
+    appUri = baseUri.replace(/\/[^/?]+(\?|$)/, "/application_db$1");
+  }
+
+  console.log("🔌 Connecting to application_db...");
+  applicationConnection = mongoose.createConnection(appUri, {
+    serverSelectionTimeoutMS: 10000,
+  });
+
+  applicationConnection.on("connected", () => {
+    console.log(
+      `✅ MongoDB Connected (Application DB): ${applicationConnection.host}/application_db`
+    );
+  });
+
+  applicationConnection.on("error", (err) => {
+    console.error("❌ Application DB connection error:", err.message);
+  });
+
+  return applicationConnection;
 };
 
-// Export a Proxy that intercepts calls and routes them to the correct connection
-const ApplicationProxy = new Proxy({}, {
+// ═══════════════════════════════════════════════════════════════
+// MODEL FACTORY — Compile model on the application_db connection
+// ═══════════════════════════════════════════════════════════════
+const getApplicationModel = () => {
+  const conn = getApplicationConnection();
+
+  if (!conn) {
+    // Fallback: use default mongoose (will produce wrong data but won't crash)
+    if (mongoose.models["Application"]) return mongoose.models["Application"];
+    return mongoose.model("Application", applicationSchema);
+  }
+
+  if (conn.models["Application"]) {
+    return conn.models["Application"];
+  }
+
+  return conn.model("Application", applicationSchema);
+};
+
+// ═══════════════════════════════════════════════════════════════
+// EXPORT PROXY — Transparently routes all Mongoose operations
+// to the application_db connection without any controller changes.
+// ═══════════════════════════════════════════════════════════════
+const ApplicationProxy = new Proxy(function () {}, {
   get(target, prop) {
     const model = getApplicationModel();
     const value = model[prop];
@@ -136,7 +207,11 @@ const ApplicationProxy = new Proxy({}, {
   construct(target, args) {
     const Model = getApplicationModel();
     return new Model(...args);
-  }
+  },
+  apply(target, thisArg, args) {
+    const Model = getApplicationModel();
+    return new Model(...args);
+  },
 });
 
 module.exports = ApplicationProxy;
