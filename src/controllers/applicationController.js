@@ -6,6 +6,22 @@ const User = require("../models/User");
 const mongoose = require("mongoose");
 
 // ═══════════════════════════════════════════════════════════════
+// RESUME PROXY URL BUILDER
+// Transforms raw Cloudinary resume URLs into proper proxy URLs
+// that stream validated PDF buffers with correct headers.
+// ═══════════════════════════════════════════════════════════════
+const APPLICATION_SERVICE_BASE_URL =
+  process.env.APPLICATION_SERVICE_URL ||
+  process.env.APPLICATION_BACKEND_URL ||
+  "https://smilejobs-application-backend.onrender.com";
+
+const buildResumeProxyUrl = (userId) => {
+  if (!userId) return "";
+  const base = APPLICATION_SERVICE_BASE_URL.replace(/\/+$/, "");
+  return `${base}/api/profile/resume/view/${userId}`;
+};
+
+// ═══════════════════════════════════════════════════════════════
 // SEQUENTIAL STATUS WORKFLOW DEFINITION
 // Enforces step-by-step progression - no skipping stages
 // ═══════════════════════════════════════════════════════════════
@@ -48,6 +64,7 @@ const isValidTransition = (currentStatus, newStatus) => {
 
 // ═══════════════════════════════════════════════════════════════
 // ENRICHMENT HELPER: Attach recruiter + user info to applications
+// Also transforms resume URLs to use the proxy endpoint
 // ═══════════════════════════════════════════════════════════════
 const enrichApplications = async (applications) => {
   if (!applications || applications.length === 0) return [];
@@ -135,8 +152,20 @@ const enrichApplications = async (applications) => {
     const currentStatus = appObj.status || "Applied";
     const allowedNextStatuses = STATUS_WORKFLOW[currentStatus] || [];
 
+    // ═══════════════════════════════════════════════════════════
+    // 🔧 RESUME URL TRANSFORMATION
+    // Replace raw Cloudinary URL with the mobile app backend's
+    // proxy endpoint that streams a validated PDF buffer.
+    // ═══════════════════════════════════════════════════════════
+    const originalResumeUrl = appObj.resumeUrl || "";
+    const proxyResumeUrl = userIdStr ? buildResumeProxyUrl(userIdStr) : "";
+
     return {
       ...appObj,
+      // Replace resume URL with proxy URL (fixes "corrupted file" issue)
+      resumeUrl: proxyResumeUrl || originalResumeUrl,
+      // Preserve original for debugging/fallback
+      resumeOriginalUrl: originalResumeUrl,
       // Recruiter (job poster) details
       recruiter: recruiterData
         ? {
