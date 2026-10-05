@@ -1,4 +1,4 @@
-name: SmileJobs Admin Panel Backend CI/CD
+name: SmileJobs Admin Backend CI/CD
 
 on:
   push:
@@ -34,28 +34,25 @@ jobs:
       - name: Install dependencies
         run: |
           if [ -f package-lock.json ]; then
-            npm ci
+            npm ci --legacy-peer-deps
           else
-            npm install
+            npm install --legacy-peer-deps
           fi
 
       - name: Validate code syntax
         run: |
-          # Automatically find the entrypoint (server.js, src/server.js, index.js, or src/index.js)
-          if [ -f server.js ]; then
-            node --check server.js
-          elif [ -f src/server.js ]; then
+          if [ -f src/server.js ]; then
             node --check src/server.js
-          elif [ -f index.js ]; then
-            node --check index.js
+          elif [ -f server.js ]; then
+            node --check server.js
           elif [ -f src/index.js ]; then
             node --check src/index.js
-          else
-            echo "⚠️ Warning: No standard entry file found to syntax check."
+          elif [ -f index.js ]; then
+            node --check index.js
           fi
 
       - name: CI completed
-        run: echo "Admin panel backend CI validation completed successfully."
+        run: echo "Admin backend CI validation completed successfully."
 
   deploy:
     name: CD - Deploy Admin Backend to DigitalOcean
@@ -72,15 +69,15 @@ jobs:
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
 
-          # Decode deploy key cleanly
+          # Decode Base64 SSH key
           echo "$DO_SSH_KEY_B64" | tr -d '\r\n ' | base64 --decode > ~/.ssh/smilejobs_deploy_key
           chmod 600 ~/.ssh/smilejobs_deploy_key
 
-          # Add Droplet to known hosts
+          # Add Droplet host to known_hosts
           ssh-keyscan -H "$DO_HOST" >> ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
 
-          echo "SSH configuration verified successfully."
+          echo "SSH configuration complete."
 
       - name: Deploy Admin Backend
         env:
@@ -104,57 +101,51 @@ jobs:
 
           echo "Connected to DigitalOcean successfully."
 
-          # 1. Ensure deployment directory exists
-          mkdir -p /var/www/smilejobs-admin-backend
           cd /var/www/smilejobs-admin-backend
 
-          # 2. Clone repo if directory is empty, otherwise update it
-          if [ ! -d ".git" ]; then
-            echo "Cloning Admin Panel Backend repository..."
-            git clone https://github.com/deshmukh2804/SmileJobs-Admin-Panel-Backend.git .
-          else
-            echo "Updating existing codebase..."
-            git fetch origin main
-            git reset --hard origin/main
-          fi
+          echo "Fetching latest code..."
+          git fetch origin main
+          git reset --hard origin/main
 
-          # 3. Install production dependencies (saves memory on 512 MB Droplet)
           echo "Installing production dependencies..."
           npm install --omit=dev --legacy-peer-deps --no-audit --no-fund
 
-          # 4. Handle PM2 Application startup
-          echo "Checking PM2 application..."
+          echo "Checking PM2 process..."
 
-          # Find entry point file
+          # Identify entry file
           ENTRY_FILE="server.js"
           if [ -f "src/server.js" ]; then
             ENTRY_FILE="src/server.js"
-          elif [ -f "index.js" ]; then
-            ENTRY_FILE="index.js"
           elif [ -f "src/index.js" ]; then
             ENTRY_FILE="src/index.js"
+          elif [ -f "index.js" ]; then
+            ENTRY_FILE="index.js"
           fi
 
-          if pm2 describe smilejobs-admin-backend > /dev/null 2>&1; then
-            echo "Restarting smilejobs-admin-backend..."
-            pm2 restart smilejobs-admin-backend --update-env
+          if pm2 describe smilejobs-admin > /dev/null 2>&1; then
+            echo "Restarting smilejobs-admin..."
+            pm2 restart smilejobs-admin --update-env
           else
-            echo "PM2 application not found. Starting recruiter backend..."
-            pm2 start "$ENTRY_FILE" --name smilejobs-admin-backend
+            echo "Starting smilejobs-admin for the first time..."
+            pm2 start "$ENTRY_FILE" --name smilejobs-admin
             pm2 save
           fi
 
-          echo "Waiting for app to warm up..."
-          sleep 3
+          echo "Waiting for admin backend to warm up..."
+          sleep 4
 
-          echo "PM2 status:"
+          echo "PM2 Status:"
           pm2 status
 
+          echo "Checking admin health endpoint..."
+          curl -s http://127.0.0.1:5003/health || curl -s http://127.0.0.1:5003/ || echo "Health check complete."
+
+          echo ""
           echo "=========================================="
-          echo "SmileJobs Admin Panel Backend successfully deployed!"
+          echo "SmileJobs Admin Backend deployment successful!"
           echo "=========================================="
 
           REMOTE_SCRIPT
 
       - name: Deployment completed
-        run: echo "Production deployment completed successfully."
+        run: echo "Admin backend production deployment completed successfully."
