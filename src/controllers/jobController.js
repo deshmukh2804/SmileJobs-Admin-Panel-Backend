@@ -828,6 +828,9 @@ const deleteJob = async (req, res) => {
 };
 
 // @desc    Approve job
+// ═══════════════════════════════════════════════════════════
+// REPLACE your existing approveJob with this enhanced version
+// ═══════════════════════════════════════════════════════════
 const approveJob = async (req, res) => {
   try {
     const job = await Job.findById(req.params.id);
@@ -837,19 +840,71 @@ const approveJob = async (req, res) => {
       return res.status(403).json({ success: false, message: "Access denied. Admin role required." });
     }
 
+    const adminUser = req.authUser || req.admin;
+    const adminName = adminUser?.name || adminUser?.email || "Admin";
+
+    // Update job status
     job.status = "Live";
     job.isActive = true;
     job.postedAt = new Date();
+    job.isNew = true;
+
+    // ✅ NEW: Update approval tracking fields
+    job.approvalStatus = "approved";
+    job.approvedAt = new Date();
+    job.approvedBy = adminName;
+    job.rejectionReason = "";
+    job.reviewNotes = req.body.notes || "";
+    job.lastEditedAfterApproval = false;
+
     await job.save();
 
-    res.status(200).json({ success: true, message: "Job approved and is now live", data: job });
+    // ✅ Send email notification to recruiter (non-blocking)
+    try {
+      const mailer = require("../utils/mailer");
+      if (job.recruiterEmail && mailer && mailer.sendMail) {
+        await mailer.sendMail({
+          to: job.recruiterEmail,
+          subject: `✅ Your Job "${job.title}" Has Been Approved!`,
+          html: `
+            <div style="font-family:Arial,sans-serif;max-width:500px;margin:0 auto;padding:20px;">
+              <h2 style="color:#16a34a;">🎉 Job Approved!</h2>
+              <p>Hi Recruiter,</p>
+              <p>Your job posting <strong>"${job.title}"</strong> at <strong>${job.companyName}</strong> has been <strong style="color:#16a34a;">approved</strong> and is now <strong>live</strong> on the platform.</p>
+              <p>Candidates can now see and apply to this job.</p>
+              ${req.body.notes ? `<p style="color:#666;"><em>Admin notes: ${req.body.notes}</em></p>` : ""}
+              <p style="color:#999;font-size:12px;">Approved by: ${adminName} • ${new Date().toLocaleString()}</p>
+            </div>
+          `,
+        }).catch((e) => console.warn("⚠️ Approval email failed:", e.message));
+      }
+    } catch (emailErr) {
+      console.warn("⚠️ Could not send approval email:", emailErr.message);
+    }
+
+    console.log(`✅ Job approved: "${job.title}" [${job._id}] by ${adminName}`);
+
+    res.status(200).json({
+      success: true,
+      message: "Job approved and is now live",
+      data: {
+        _id: job._id,
+        title: job.title,
+        status: job.status,
+        approvalStatus: job.approvalStatus,
+        approvedAt: job.approvedAt,
+        approvedBy: job.approvedBy,
+      },
+    });
   } catch (error) {
     console.error("Approve Job Error:", error.message);
     res.status(500).json({ success: false, message: "Server error while approving job" });
   }
 };
 
-// @desc    Reject job
+// ═══════════════════════════════════════════════════════════
+// REPLACE your existing rejectJob with this enhanced version
+// ═══════════════════════════════════════════════════════════
 const rejectJob = async (req, res) => {
   try {
     const job = await Job.findById(req.params.id);
@@ -859,19 +914,75 @@ const rejectJob = async (req, res) => {
       return res.status(403).json({ success: false, message: "Access denied. Admin role required." });
     }
 
+    const reason = req.body.reason || req.body.rejectionReason || "";
+    if (!reason.trim()) {
+      return res.status(400).json({ success: false, message: "Rejection reason is required" });
+    }
+
+    const adminUser = req.authUser || req.admin;
+    const adminName = adminUser?.name || adminUser?.email || "Admin";
+
     job.status = "Rejected";
-    job.rejectionReason = req.body.reason || "";
+    job.isActive = false;
+
+    // ✅ NEW: Update approval tracking fields
+    job.approvalStatus = "rejected";
+    job.rejectionReason = reason.trim();
+    job.reviewNotes = req.body.notes || "";
+    job.approvedAt = null;
+    job.approvedBy = "";
+
     await job.save();
 
-    res.status(200).json({ success: true, message: "Job has been rejected", data: job });
+    // ✅ Send email notification to recruiter (non-blocking)
+    try {
+      const mailer = require("../utils/mailer");
+      if (job.recruiterEmail && mailer && mailer.sendMail) {
+        await mailer.sendMail({
+          to: job.recruiterEmail,
+          subject: `❌ Your Job "${job.title}" Was Not Approved`,
+          html: `
+            <div style="font-family:Arial,sans-serif;max-width:500px;margin:0 auto;padding:20px;">
+              <h2 style="color:#dc2626;">Job Not Approved</h2>
+              <p>Hi Recruiter,</p>
+              <p>Your job posting <strong>"${job.title}"</strong> at <strong>${job.companyName}</strong> was <strong style="color:#dc2626;">not approved</strong>.</p>
+              <div style="background:#fef2f2;border-left:4px solid #dc2626;padding:12px;margin:16px 0;border-radius:4px;">
+                <strong>Reason:</strong> ${reason}
+              </div>
+              <p>Please fix the issues and resubmit your job posting.</p>
+              ${req.body.notes ? `<p style="color:#666;"><em>Additional notes: ${req.body.notes}</em></p>` : ""}
+              <p style="color:#999;font-size:12px;">Reviewed by: ${adminName} • ${new Date().toLocaleString()}</p>
+            </div>
+          `,
+        }).catch((e) => console.warn("⚠️ Rejection email failed:", e.message));
+      }
+    } catch (emailErr) {
+      console.warn("⚠️ Could not send rejection email:", emailErr.message);
+    }
+
+    console.log(`❌ Job rejected: "${job.title}" [${job._id}] by ${adminName} — Reason: ${reason}`);
+
+    res.status(200).json({
+      success: true,
+      message: "Job has been rejected",
+      data: {
+        _id: job._id,
+        title: job.title,
+        status: job.status,
+        approvalStatus: job.approvalStatus,
+        rejectionReason: job.rejectionReason,
+      },
+    });
   } catch (error) {
     console.error("Reject Job Error:", error.message);
     res.status(500).json({ success: false, message: "Server error while rejecting job" });
   }
 };
 
-// @desc    Toggle featured status
-const toggleFeature = async (req, res) => {
+// ═══════════════════════════════════════════════════════════
+// ✅ NEW: Suspend a live job (admin can pull it down anytime)
+// ═══════════════════════════════════════════════════════════
+const suspendJob = async (req, res) => {
   try {
     const job = await Job.findById(req.params.id);
     if (!job) return res.status(404).json({ success: false, message: "Job not found" });
@@ -880,102 +991,35 @@ const toggleFeature = async (req, res) => {
       return res.status(403).json({ success: false, message: "Access denied. Admin role required." });
     }
 
-    job.featured = !job.featured;
-    await job.save();
+    const adminUser = req.authUser || req.admin;
+    const adminName = adminUser?.name || adminUser?.email || "Admin";
+    const reason = req.body.reason || "Suspended by admin for policy review";
 
-    res.status(200).json({
-      success: true,
-      message: `Job ${job.featured ? "featured" : "unfeatured"} successfully`,
-      data: { featured: job.featured },
-    });
-  } catch (error) {
-    console.error("Toggle Feature Error:", error.message);
-    res.status(500).json({ success: false, message: "Server error while toggling feature" });
-  }
-};
-
-// @desc    Toggle job status
-const toggleStatus = async (req, res) => {
-  try {
-    const job = await Job.findById(req.params.id);
-    if (!job) return res.status(404).json({ success: false, message: "Job not found" });
-
-    if (!canManageJob(req, job)) {
-      return res.status(403).json({ success: false, message: "Unauthorized status change attempt." });
-    }
-
-    if (job.status === "Live") {
-      job.status = "Closed";
-      job.isActive = false;
-    } else if (job.status === "Closed" || job.status === "Expired") {
-      job.status = "Live";
-      job.isActive = true;
-    } else {
-      return res.status(400).json({
-        success: false,
-        message: `Cannot toggle status for a job that is ${job.status}`,
-      });
-    }
+    job.status = "Closed";
+    job.isActive = false;
+    job.approvalStatus = "suspended";
+    job.rejectionReason = reason;
+    job.reviewNotes = req.body.notes || "";
 
     await job.save();
 
-    res.status(200).json({
-      success: true,
-      message: `Job is now ${job.status}`,
-      data: { status: job.status, isActive: job.isActive },
-    });
-  } catch (error) {
-    console.error("Toggle Status Error:", error.message);
-    res.status(500).json({ success: false, message: "Server error while toggling status" });
-  }
-};
-
-// @desc    Update contact visibility
-const updateContactVisibility = async (req, res) => {
-  try {
-    const job = await Job.findById(req.params.id);
-    if (!job) return res.status(404).json({ success: false, message: "Job not found" });
-
-    if (!canManageJob(req, job)) {
-      return res.status(403).json({ success: false, message: "Not authorized to modify visibility." });
-    }
-
-    const { whatsapp, mobile } = req.body;
-
-    if (whatsapp === true && !job.recruiterWhatsappNumber) {
-      return res.status(400).json({
-        success: false,
-        message: "WhatsApp number is required when WhatsApp visibility is enabled.",
-      });
-    }
-    if (mobile === true && !job.recruiterMobileNumber) {
-      return res.status(400).json({
-        success: false,
-        message: "Mobile number is required when mobile visibility is enabled.",
-      });
-    }
-
-    if (typeof whatsapp === "boolean") {
-      job.contactVisibility.whatsapp = whatsapp;
-      job.whatsappContactEnabled = whatsapp;
-    }
-    if (typeof mobile === "boolean") {
-      job.contactVisibility.mobile = mobile;
-    }
-
-    await job.save();
+    console.log(`🚫 Job suspended: "${job.title}" [${job._id}] by ${adminName}`);
 
     res.status(200).json({
       success: true,
-      message: "Contact visibility settings updated successfully",
-      data: job.contactVisibility,
+      message: "Job has been suspended",
+      data: {
+        _id: job._id,
+        title: job.title,
+        status: job.status,
+        approvalStatus: job.approvalStatus,
+      },
     });
   } catch (error) {
-    console.error("Update Contact Visibility Error:", error.message);
-    res.status(500).json({ success: false, message: "Server error" });
+    console.error("Suspend Job Error:", error.message);
+    res.status(500).json({ success: false, message: "Server error while suspending job" });
   }
 };
-
 module.exports = {
   createJob,
   getJobs,

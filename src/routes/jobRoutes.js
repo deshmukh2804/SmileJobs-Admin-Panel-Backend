@@ -8,39 +8,47 @@ const {
   deleteJob,
   approveJob,
   rejectJob,
+  suspendJob,
   toggleFeature,
   toggleStatus,
   updateContactVisibility,
 } = require("../controllers/jobController");
-const {
-  authenticateAny,
-  optionalAuth,
-  requireAdmin,
-  requireRecruiterOrAdmin,
-} = require("../middleware/roleMiddleware");
-const { uploadCompanyFiles } = require("../utils/uploadMiddleware");
+const { protect, requirePermission } = require("../middleware/authMiddleware");
+const upload = require("../utils/uploadMiddleware");
 
-// Public/Any with optional auth
-router.get("/", optionalAuth, getJobs);
-router.get("/:id", optionalAuth, getJobById);
+// Public routes (candidate app reads these)
+router.get("/", getJobs);
+router.get("/:id", getJobById);
 
-// Auth required — Cloudinary upload support attached
-router.post("/", authenticateAny, requireRecruiterOrAdmin, uploadCompanyFiles, createJob);
-router.put("/:id", authenticateAny, requireRecruiterOrAdmin, uploadCompanyFiles, updateJob);
-router.delete("/:id", authenticateAny, requireRecruiterOrAdmin, deleteJob);
-
-// Admin actions
-router.patch("/:id/approve", authenticateAny, requireAdmin, approveJob);
-router.patch("/:id/reject", authenticateAny, requireAdmin, rejectJob);
-router.patch("/:id/toggle-feature", authenticateAny, requireAdmin, toggleFeature);
-router.patch("/:id/toggle-status", authenticateAny, requireRecruiterOrAdmin, toggleStatus);
-
-// Contact visibility (recruiter/admin)
-router.patch(
-  "/:id/contact-visibility",
-  authenticateAny,
-  requireRecruiterOrAdmin,
-  updateContactVisibility
+// Protected routes
+router.post(
+  "/",
+  protect,
+  upload.fields([
+    { name: "logo", maxCount: 1 },
+    { name: "images", maxCount: 5 },
+  ]),
+  createJob
 );
+router.put(
+  "/:id",
+  protect,
+  upload.fields([
+    { name: "logo", maxCount: 1 },
+    { name: "images", maxCount: 5 },
+  ]),
+  updateJob
+);
+router.delete("/:id", protect, deleteJob);
+
+// ✅ Admin approval routes
+router.post("/:id/approve", protect, approveJob);
+router.post("/:id/reject", protect, rejectJob);
+router.post("/:id/suspend", protect, suspendJob);   // ✅ NEW
+
+// Admin management routes
+router.patch("/:id/feature", protect, toggleFeature);
+router.patch("/:id/status", protect, toggleStatus);
+router.patch("/:id/visibility", protect, updateContactVisibility);
 
 module.exports = router;

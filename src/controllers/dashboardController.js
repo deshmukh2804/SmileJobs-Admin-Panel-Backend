@@ -108,10 +108,9 @@ exports.getDashboardStats = async (req, res) => {
     const verifiedCompanies = await safeCount(Company, { verified: true });
     const totalCompanies = await safeCount(Company);
     const totalJobs = await safeCount(Job);
-
-    const pendingJobs = await safeCount(Job, {
-      status: { $in: ["Pending", "pending", "PENDING", "Under Review"] },
-    });
+const pendingJobs = await safeCount(Job, {
+  status: { $in: ["Pending Approval", "Pending", "pending", "PENDING", "Under Review"] },
+});
 
     const candidatesLastMonth = await safeCount(User, {
       createdAt: { $gte: startOfLastMonth, $lte: endOfLastMonth },
