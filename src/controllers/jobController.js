@@ -2,6 +2,7 @@
 const Job = require("../models/Job");
 const Company = require("../models/Company");
 const Recruiter = require("../models/Recruiter");
+const jwt = require("jsonwebtoken");
 const {
   normalizeWhatsAppNumber,
   generateWhatsAppUrl,
@@ -225,9 +226,9 @@ const createJob = async (req, res) => {
     const resolvedCompanyName = company ? company.name : body.companyName || (recruiter ? recruiter.companyName : "");
 
     // ─────────────────────────────────────────────────────────────
-    // APPROVAL & STATUS DETERMINATION
-    // If created by Admin/SuperAdmin => Live immediately.
-    // If created by Recruiter => Pending Approval + pending_review + isActive: false
+    // STATUS & WORKFLOW CONTROL
+    // Recruiter -> Goes to Approval Queue (Pending / pending_review)
+    // Admin / SuperAdmin -> Goes Live directly
     // ─────────────────────────────────────────────────────────────
     let finalStatus = "Pending Approval";
     let finalApprovalStatus = "pending_review";
@@ -236,7 +237,6 @@ const createJob = async (req, res) => {
     let approvedBy = "";
 
     if (isAuthorizedAdminUser) {
-      // If admin explicitly specified status (e.g. Draft), respect it
       if (body.status && body.status !== "Pending Approval") {
         finalStatus = body.status;
         finalApprovalStatus = body.status === "Live" ? "approved" : "pending_review";
@@ -251,7 +251,6 @@ const createJob = async (req, res) => {
         approvedBy = user.name || user.email || "Admin";
       }
     } else {
-      // Recruiter ALWAYS goes through approval
       finalStatus = "Pending Approval";
       finalApprovalStatus = "pending_review";
       finalIsActive = false;
@@ -299,7 +298,7 @@ const createJob = async (req, res) => {
       applicationUrl: body.applicationUrl,
       noPaymentInvolved: body.noPaymentInvolved !== false && body.noPaymentInvolved !== "false",
 
-      // Contact info
+      // Contact Info
       recruiterEmail: body.recruiterEmail || (recruiter ? recruiter.email : user.email || ""),
       recruiterMobileNumber: mobileNum ? normalizeWhatsAppNumber(mobileNum) : recruiter ? recruiter.phone || "" : "",
       recruiterWhatsappNumber: whatsappNum ? normalizeWhatsAppNumber(whatsappNum) : "",
@@ -312,7 +311,7 @@ const createJob = async (req, res) => {
       contactVisibility: visibility,
       whatsappContactEnabled: visibility.whatsapp,
 
-      // Status & Settings
+      // Statuses
       status: finalStatus,
       approvalStatus: finalApprovalStatus,
       isActive: finalIsActive,
@@ -354,7 +353,7 @@ const createJob = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// @desc    Get all jobs (Candidate app + Admin panel)
+// @desc    Get all jobs (Now with optional JWT decoding for public route)
 // @route   GET /api/v1/jobs
 // ═══════════════════════════════════════════════════════════════
 const getJobs = async (req, res) => {
@@ -372,8 +371,47 @@ const getJobs = async (req, res) => {
       sort = "-createdAt",
     } = req.query;
 
-    const user = req.authUser || req.admin;
-    const isAllowedToAccessUnpublished = isAnyAdmin(req);
+    // ─── OPTIONAL JWT PARSING FOR THE PUBLIC ROUTE ───
+    let user = req.authUser || req.admin;
+    if (!user && req.headers.authorization && req.headers.authorization.startsWith("Bearer")) {
+      try {
+        const token = req.headers.authorization.split(" ")[1];
+        const secrets = [
+          process.env.JWT_SECRET,
+          process.env.JWT_ADMIN_SECRET,
+          process.env.ADMIN_JWT_SECRET,
+          process.env.JWT_ACCESS_SECRET,
+          "careerflow_secret"
+        ].filter(Boolean);
+
+        for (const secret of secrets) {
+          try {
+            const decoded = jwt.verify(token, secret);
+            if (decoded) {
+              user = decoded;
+              req.authUser = decoded; // Populate on req for consistency
+              break;
+            }
+          } catch (e) {
+            // Keep trying next secret
+          }
+        }
+
+        // Development fallback: non-verifying decode
+        if (!user && process.env.NODE_ENV !== 'production') {
+          const decoded = jwt.decode(token);
+          if (decoded) {
+            user = decoded;
+            req.authUser = decoded;
+          }
+        }
+      } catch (err) {
+        console.warn("Optional JWT parsing bypassed in getJobs:", err.message);
+      }
+    }
+
+    const isAllowedToAccessUnpublished =
+      user && ["superadmin", "admin", "moderator", "supportagent", "contentmanager", "financemanager"].includes(normalizeRole(user.role));
     const isRecruiterUser = user && normalizeRole(user.role) === "recruiter";
 
     const filter = {};
@@ -392,6 +430,7 @@ const getJobs = async (req, res) => {
 
     // ── ADMIN / PARAM FILTERING ──
     if (status && status !== "All") {
+      // ✅ Matches status: 'Live' with 'pending_review' documents so they display in Admin Approval View!
       if (status === "Pending" || status === "Pending Approval" || status === "pending_review") {
         filter.$or = [
           { status: "Pending Approval" },
@@ -671,7 +710,6 @@ const updateJob = async (req, res) => {
       designation: body.contactPerson?.designation || body.recruiterDesignation || job.contactPerson?.designation || "",
     };
 
-    // If recruiter edits an already approved job, flag it for review
     if (!isAuthorizedAdmin && job.approvalStatus === "approved") {
       body.lastEditedAfterApproval = true;
     }
@@ -764,7 +802,7 @@ const updateJob = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// @desc    Delete a job (Protected & safe asset deletion)
+// @desc    Delete a job
 // @route   DELETE /api/v1/jobs/:id
 // ═══════════════════════════════════════════════════════════════
 const deleteJob = async (req, res) => {
@@ -831,7 +869,7 @@ const deleteJob = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// @desc    Approve job (Admin action -> Makes job Live for Candidates)
+// @desc    Approve job (Moves job to Live and updates approvals)
 // @route   POST or PATCH /api/v1/jobs/:id/approve
 // ═══════════════════════════════════════════════════════════════
 const approveJob = async (req, res) => {
@@ -899,7 +937,7 @@ const approveJob = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// @desc    Reject job (Admin action)
+// @desc    Reject job
 // @route   POST or PATCH /api/v1/jobs/:id/reject
 // ═══════════════════════════════════════════════════════════════
 const rejectJob = async (req, res) => {
@@ -1003,7 +1041,7 @@ const suspendJob = async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════════
 // @desc    Toggle featured status
-// @route   PATCH /api/v1/jobs/:id/feature or toggle-feature
+// @route   PATCH /api/v1/jobs/:id/feature
 // ═══════════════════════════════════════════════════════════════
 const toggleFeature = async (req, res) => {
   try {
@@ -1030,7 +1068,7 @@ const toggleFeature = async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════════
 // @desc    Toggle status (Live <-> Closed)
-// @route   PATCH /api/v1/jobs/:id/status or toggle-status
+// @route   PATCH /api/v1/jobs/:id/status
 // ═══════════════════════════════════════════════════════════════
 const toggleStatus = async (req, res) => {
   try {
@@ -1065,7 +1103,7 @@ const toggleStatus = async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════════
 // @desc    Update contact visibility
-// @route   PATCH /api/v1/jobs/:id/visibility or contact-visibility
+// @route   PATCH /api/v1/jobs/:id/visibility
 // ═══════════════════════════════════════════════════════════════
 const updateContactVisibility = async (req, res) => {
   try {
