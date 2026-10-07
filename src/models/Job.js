@@ -113,6 +113,18 @@ const jobSchema = new mongoose.Schema(
     isNew: { type: Boolean, default: true },
     isCompanyVerified: { type: Boolean, default: false },
 
+    // ✅ NEW: Job Source Tracking
+    postedBy: {
+      type: String,
+      enum: ["admin", "recruiter"],
+      default: "recruiter",
+      index: true,
+    },
+    postedByUserId: { type: String, default: "" }, // Stores admin ID or recruiter ID
+    postedByName: { type: String, default: "" },
+    postedByEmail: { type: String, default: "" },
+    postedByRole: { type: String, default: "" },
+
     // Approval tracking fields
     approvalStatus: {
       type: String,
@@ -135,6 +147,7 @@ const jobSchema = new mongoose.Schema(
 );
 
 jobSchema.index({ status: 1, approvalStatus: 1, isActive: 1, createdAt: -1 });
+jobSchema.index({ postedBy: 1, status: 1 });
 jobSchema.index({ recruiterId: 1, status: 1 });
 jobSchema.index({ companyId: 1, status: 1 });
 jobSchema.index({ "location.city": 1, status: 1 });
