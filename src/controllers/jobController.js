@@ -14,7 +14,7 @@ const {
 } = require("../utils/cloudinary");
 
 /* ─────────────────────────────────────────────────────────────
-   UNIVERSAL ROLE NORMALIZATION & BYPASS UTILITIES
+   UNIVERSAL ROLE NORMALIZATION & UTILITIES
    ───────────────────────────────────────────────────────────── */
 const normalizeRole = (role) => {
   if (!role) return "";
@@ -31,7 +31,14 @@ const isAnyAdmin = (req) => {
   const user = req.authUser || req.admin;
   if (!user) return false;
   const norm = normalizeRole(user.role);
-  return ["superadmin", "admin", "moderator", "supportagent", "contentmanager", "financemanager"].includes(norm);
+  return [
+    "superadmin",
+    "admin",
+    "moderator",
+    "supportagent",
+    "contentmanager",
+    "financemanager",
+  ].includes(norm);
 };
 
 const canManageJob = (req, job) => {
@@ -39,10 +46,9 @@ const canManageJob = (req, job) => {
   if (!user) return false;
 
   const normRole = normalizeRole(user.role);
-  if (normRole === "superadmin") return true;
-  if (normRole === "admin") return true;
+  if (normRole === "superadmin" || normRole === "admin") return true;
 
-  const userId = user.id || user.adminId;
+  const userId = user.id || user.adminId || user._id;
   if (job.recruiterId && userId && job.recruiterId.toString() === userId.toString()) {
     return true;
   }
@@ -72,7 +78,7 @@ const parseArrayField = (value) => {
     .filter(Boolean);
 };
 
-// Helper: sanitize job for public consumption — ensures ALL fields present
+// Helper: sanitize job for public consumption
 const sanitizeJobForPublic = (job, isAuthorized = false) => {
   const jobObj = job.toObject ? job.toObject({ virtuals: true }) : { ...job };
 
@@ -97,18 +103,19 @@ const sanitizeJobForPublic = (job, isAuthorized = false) => {
     jobObj.whatsapp = { enabled: false };
   }
 
-  // ─── EXPLICITLY ENSURE ALL NEW FIELDS ARE PRESENT ───
-  jobObj.noticePeriod = jobObj.noticePeriod || '';
+  jobObj.noticePeriod = jobObj.noticePeriod || "";
   jobObj.establishedYear = jobObj.establishedYear || null;
-  jobObj.organizationSize = jobObj.organizationSize || '';
-  jobObj.industry = jobObj.industry || '';
-  jobObj.companyAddress = jobObj.companyAddress || { city: '', state: '', country: 'India' };
+  jobObj.organizationSize = jobObj.organizationSize || "";
+  jobObj.industry = jobObj.industry || "";
+  jobObj.companyAddress = jobObj.companyAddress || { city: "", state: "", country: "India" };
 
   return jobObj;
 };
 
+// ═══════════════════════════════════════════════════════════════
 // @desc    Create a new job
 // @route   POST /api/v1/jobs
+// ═══════════════════════════════════════════════════════════════
 const createJob = async (req, res) => {
   try {
     const user = req.authUser || req.admin;
@@ -116,12 +123,13 @@ const createJob = async (req, res) => {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
-    const userId = user.id || user.adminId;
+    const userId = user.id || user.adminId || user._id;
     const userRole = user.role;
+    const isAuthorizedAdminUser = isAnyAdmin(req);
 
-    // Parse nested fields when coming from multipart form-data
     const body = { ...req.body };
 
+    // Parse nested multipart fields
     if (body.location && typeof body.location === "string") body.location = safeParseJSON(body.location, {});
     if (body.salary && typeof body.salary === "string") body.salary = safeParseJSON(body.salary, {});
     if (body.experience && typeof body.experience === "string") body.experience = safeParseJSON(body.experience, {});
@@ -146,7 +154,6 @@ const createJob = async (req, res) => {
     const whatsappNum = body.recruiterWhatsappNumber ? String(body.recruiterWhatsappNumber).trim() : "";
     const mobileNum = body.recruiterMobileNumber ? String(body.recruiterMobileNumber).trim() : "";
 
-    // Toggle validation
     if (visibility.whatsapp && !whatsappNum) {
       return res.status(400).json({
         success: false,
@@ -167,7 +174,9 @@ const createJob = async (req, res) => {
     }
 
     let recruiter = null;
-    if (normalizeRole(userRole) === "recruiter") recruiter = await Recruiter.findById(userId);
+    if (normalizeRole(userRole) === "recruiter" || !isAuthorizedAdminUser) {
+      recruiter = await Recruiter.findById(userId);
+    }
 
     let company = null;
     if (body.companyId) company = await Company.findById(body.companyId);
@@ -177,7 +186,7 @@ const createJob = async (req, res) => {
       return name.split(" ").map((w) => w[0]).join("").toUpperCase().slice(0, 2);
     };
 
-    // ========== CLOUDINARY UPLOADS ==========
+    // Cloudinary Uploads
     let companyLogo = undefined;
     let companyImages = [];
 
@@ -201,34 +210,52 @@ const createJob = async (req, res) => {
       if (Array.isArray(parsed)) companyImages = parsed;
     }
 
-    const isAuthorizedAdminUser = ["superadmin", "admin"].includes(normalizeRole(userRole));
-
-    // ─── EXTRACT COMPANY INFO FROM MULTIPLE POSSIBLE SOURCES ───
-    const establishedYearRaw =
-      body.establishedYear ??
-      body.company?.establishedYear ??
-      null;
+    const establishedYearRaw = body.establishedYear ?? body.company?.establishedYear ?? null;
     const establishedYear = establishedYearRaw ? Number(establishedYearRaw) : undefined;
+    const organizationSize = body.organizationSize ?? body.company?.organizationSize ?? "";
+    const industry = body.industry ?? body.company?.industry ?? (company ? company.industry : "");
 
-    const organizationSize =
-      body.organizationSize ??
-      body.company?.organizationSize ??
-      "";
-
-    const industry =
-      body.industry ??
-      body.company?.industry ??
-      (company ? company.industry : "");
-
-    // ─── COMPANY ADDRESS ───
     const companyAddress = {
       city: body.companyAddress?.city || body.companyAddressCity || "",
       state: body.companyAddress?.state || body.companyAddressState || "",
       country: body.companyAddress?.country || body.companyAddressCountry || "India",
     };
 
-    // ─── NOTICE PERIOD ───
     const noticePeriod = body.noticePeriod ? String(body.noticePeriod).trim() : "";
+    const resolvedCompanyName = company ? company.name : body.companyName || (recruiter ? recruiter.companyName : "");
+
+    // ─────────────────────────────────────────────────────────────
+    // APPROVAL & STATUS DETERMINATION
+    // If created by Admin/SuperAdmin => Live immediately.
+    // If created by Recruiter => Pending Approval + pending_review + isActive: false
+    // ─────────────────────────────────────────────────────────────
+    let finalStatus = "Pending Approval";
+    let finalApprovalStatus = "pending_review";
+    let finalIsActive = false;
+    let approvedAt = null;
+    let approvedBy = "";
+
+    if (isAuthorizedAdminUser) {
+      // If admin explicitly specified status (e.g. Draft), respect it
+      if (body.status && body.status !== "Pending Approval") {
+        finalStatus = body.status;
+        finalApprovalStatus = body.status === "Live" ? "approved" : "pending_review";
+        finalIsActive = body.status === "Live";
+      } else {
+        finalStatus = "Live";
+        finalApprovalStatus = "approved";
+        finalIsActive = true;
+      }
+      if (finalApprovalStatus === "approved") {
+        approvedAt = new Date();
+        approvedBy = user.name || user.email || "Admin";
+      }
+    } else {
+      // Recruiter ALWAYS goes through approval
+      finalStatus = "Pending Approval";
+      finalApprovalStatus = "pending_review";
+      finalIsActive = false;
+    }
 
     const jobData = {
       title: body.title,
@@ -236,12 +263,12 @@ const createJob = async (req, res) => {
       companyId: company ? company._id : body.companyId,
 
       // Company Info
-      companyName: company ? company.name : body.companyName || (recruiter ? recruiter.companyName : ""),
+      companyName: resolvedCompanyName,
       companyWebsite: company ? company.website : body.companyWebsite || "",
       companyLogo,
       companyImages,
-      companyInitials: buildInitials(company ? company.name : body.companyName),
-      isCompanyVerified: company ? company.verified : false,
+      companyInitials: buildInitials(resolvedCompanyName),
+      isCompanyVerified: company ? company.verified : recruiter ? recruiter.isVerified || false : false,
       industry,
       establishedYear,
       organizationSize: String(organizationSize).trim(),
@@ -256,10 +283,10 @@ const createJob = async (req, res) => {
       noticePeriod,
 
       // Job Details
-      jobType: body.jobType,
-      workMode: body.workMode,
+      jobType: body.jobType || "Full-Time",
+      workMode: body.workMode || "On-site",
       department: body.department,
-      role: body.role,
+      role: body.role || body.title,
       qualification: body.qualification,
       skills: body.skills,
       languages: body.languages,
@@ -272,25 +299,26 @@ const createJob = async (req, res) => {
       applicationUrl: body.applicationUrl,
       noPaymentInvolved: body.noPaymentInvolved !== false && body.noPaymentInvolved !== "false",
 
-      // Recruiter / Contact
-      recruiterEmail: body.recruiterEmail || (recruiter ? recruiter.email : ""),
-      recruiterMobileNumber: mobileNum ? normalizeWhatsAppNumber(mobileNum) : "",
+      // Contact info
+      recruiterEmail: body.recruiterEmail || (recruiter ? recruiter.email : user.email || ""),
+      recruiterMobileNumber: mobileNum ? normalizeWhatsAppNumber(mobileNum) : recruiter ? recruiter.phone || "" : "",
       recruiterWhatsappNumber: whatsappNum ? normalizeWhatsAppNumber(whatsappNum) : "",
 
       contactPerson: {
-        name: body.contactPerson?.name || body.recruiterName || (recruiter ? recruiter.name : ""),
-        designation:
-          body.contactPerson?.designation || body.recruiterDesignation || (recruiter ? recruiter.designation : ""),
+        name: body.contactPerson?.name || body.recruiterName || (recruiter ? recruiter.name : user.name || ""),
+        designation: body.contactPerson?.designation || body.recruiterDesignation || (recruiter ? recruiter.designation : ""),
       },
 
       contactVisibility: visibility,
       whatsappContactEnabled: visibility.whatsapp,
 
       // Status & Settings
-      status: isAuthorizedAdminUser
-        ? body.status || "Live"
-        : "Pending Approval",
-
+      status: finalStatus,
+      approvalStatus: finalApprovalStatus,
+      isActive: finalIsActive,
+      submittedForReviewAt: new Date(),
+      approvedAt,
+      approvedBy,
       featured: body.featured === true || body.featured === "true",
       isNew: true,
       applicantsCap: body.applicantsCap ? Number(body.applicantsCap) : 100,
@@ -309,7 +337,10 @@ const createJob = async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: "Job created successfully",
+      message:
+        finalStatus === "Live"
+          ? "Job created and is now live."
+          : "Job submitted successfully and is awaiting admin approval.",
       data: job,
     });
   } catch (error) {
@@ -322,11 +353,15 @@ const createJob = async (req, res) => {
   }
 };
 
-// @desc    Get all jobs
+// ═══════════════════════════════════════════════════════════════
+// @desc    Get all jobs (Candidate app + Admin panel)
+// @route   GET /api/v1/jobs
+// ═══════════════════════════════════════════════════════════════
 const getJobs = async (req, res) => {
   try {
     const {
       status,
+      approvalStatus,
       search,
       department,
       jobType,
@@ -337,36 +372,68 @@ const getJobs = async (req, res) => {
       sort = "-createdAt",
     } = req.query;
 
+    const user = req.authUser || req.admin;
+    const isAllowedToAccessUnpublished = isAnyAdmin(req);
+    const isRecruiterUser = user && normalizeRole(user.role) === "recruiter";
+
     const filter = {};
-    if (status && status !== "All") {
-      if (status === "Pending") filter.status = "Pending Approval";
-      else if (status === "Approved") filter.status = "Live";
-      else filter.status = status;
+
+    // ── CANDIDATE / PUBLIC CONSUMPTION ──
+    // Candidates MUST ONLY see Live + Approved + Active jobs
+    if (!isAllowedToAccessUnpublished && !isRecruiterUser) {
+      filter.status = "Live";
+      filter.approvalStatus = "approved";
+      filter.isActive = true;
+    } else if (isRecruiterUser && !isAllowedToAccessUnpublished) {
+      // Recruiter sees their own jobs (all statuses)
+      const userId = user.id || user.adminId || user._id;
+      filter.recruiterId = userId;
     }
+
+    // ── ADMIN / PARAM FILTERING ──
+    if (status && status !== "All") {
+      if (status === "Pending" || status === "Pending Approval" || status === "pending_review") {
+        filter.$or = [
+          { status: "Pending Approval" },
+          { approvalStatus: "pending_review" },
+        ];
+      } else if (status === "Approved" || status === "Live") {
+        filter.status = "Live";
+        filter.approvalStatus = "approved";
+      } else {
+        filter.status = status;
+      }
+    }
+
+    if (approvalStatus && approvalStatus !== "All") {
+      filter.approvalStatus = approvalStatus;
+    }
+
     if (search) {
+      const searchRegex = { $regex: search, $options: "i" };
       filter.$or = [
-        { title: { $regex: search, $options: "i" } },
-        { companyName: { $regex: search, $options: "i" } },
-        { department: { $regex: search, $options: "i" } },
+        { title: searchRegex },
+        { companyName: searchRegex },
+        { department: searchRegex },
+        { "contactPerson.name": searchRegex },
+        { recruiterEmail: searchRegex },
       ];
     }
+
     if (department && department !== "All") filter.department = department;
     if (jobType && jobType !== "All") filter.jobType = jobType;
     if (workMode && workMode !== "All") filter.workMode = workMode;
     if (city) filter["location.city"] = { $regex: city, $options: "i" };
 
-    const user = req.authUser || req.admin;
-    const isAllowedToAccessUnpublished =
-      user && ["admin", "super_admin", "Super Admin", "Admin", "recruiter"].some(r => normalizeRole(r) === normalizeRole(user.role));
-
-    if (!isAllowedToAccessUnpublished) {
-      filter.status = "Live";
-      filter.isActive = true;
-    }
-
     const skip = (parseInt(page) - 1) * parseInt(limit);
+
     const [jobs, total] = await Promise.all([
-      Job.find(filter).sort(sort).skip(skip).limit(parseInt(limit)),
+      Job.find(filter)
+        .populate("recruiterId", "name email phone mobile companyName isVerified designation")
+        .populate("companyId", "name logo website verified industry")
+        .sort(sort)
+        .skip(skip)
+        .limit(parseInt(limit)),
       Job.countDocuments(filter),
     ]);
 
@@ -374,16 +441,21 @@ const getJobs = async (req, res) => {
 
     const [totalCount, liveCount, pendingCount, rejectedCount, expiredCount] = await Promise.all([
       Job.countDocuments({}),
-      Job.countDocuments({ status: "Live" }),
-      Job.countDocuments({ status: "Pending Approval" }),
-      Job.countDocuments({ status: "Rejected" }),
+      Job.countDocuments({ status: "Live", approvalStatus: "approved" }),
+      Job.countDocuments({ $or: [{ status: "Pending Approval" }, { approvalStatus: "pending_review" }] }),
+      Job.countDocuments({ $or: [{ status: "Rejected" }, { approvalStatus: "rejected" }] }),
       Job.countDocuments({ status: "Expired" }),
     ]);
 
     res.status(200).json({
       success: true,
       data: sanitizedJobs,
-      pagination: { page: parseInt(page), limit: parseInt(limit), total, pages: Math.ceil(total / parseInt(limit)) },
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / parseInt(limit)),
+      },
       counts: {
         total: totalCount,
         live: liveCount,
@@ -398,24 +470,20 @@ const getJobs = async (req, res) => {
   }
 };
 
-// @desc    Get single job
+// ═══════════════════════════════════════════════════════════════
+// @desc    Get single job by ID
+// @route   GET /api/v1/jobs/:id
+// ═══════════════════════════════════════════════════════════════
 const getJobById = async (req, res) => {
   try {
-    const job = await Job.findById(req.params.id);
+    const job = await Job.findById(req.params.id)
+      .populate("recruiterId", "name email phone mobile companyName isVerified designation")
+      .populate("companyId", "name logo website verified industry");
+
     if (!job) return res.status(404).json({ success: false, message: "Job not found" });
 
     const user = req.authUser || req.admin;
-    const normRole = user ? normalizeRole(user.role) : "";
-
-    const isAdminOrRecruiter =
-      user && ["admin", "super_admin", "Super Admin", "Admin", "recruiter"].some(r => normalizeRole(r) === normRole);
-    
-    const isJobOwner =
-      user &&
-      normalizeRole(user.role) === "recruiter" &&
-      job.recruiterId.toString() === (user.id || user.adminId).toString();
-    
-    const isAuthorized = isAdminOrRecruiter || isJobOwner || normRole === "superadmin";
+    const isAuthorized = isAnyAdmin(req) || canManageJob(req, job);
 
     const sanitizedJob = sanitizeJobForPublic(job, isAuthorized);
 
@@ -427,9 +495,6 @@ const getJobById = async (req, res) => {
           : null,
     };
 
-    let company = null;
-    if (job.companyId) company = await Company.findById(job.companyId);
-
     res.status(200).json({
       success: true,
       data: {
@@ -437,19 +502,20 @@ const getJobById = async (req, res) => {
           id: job._id,
           _id: job._id,
           title: job.title,
+          recruiterId: job.recruiterId,
+          companyId: job.companyId,
           companyName: job.companyName,
           companyWebsite: job.companyWebsite,
-          companyLogo: company?.logo || job.companyLogo,
-          companyImages: company?.images || job.companyImages || [],
+          companyLogo: job.companyLogo,
+          companyImages: job.companyImages || [],
           companyInitials: job.companyInitials,
-          industry: job.industry || '',
+          industry: job.industry || "",
           establishedYear: job.establishedYear || null,
-          organizationSize: job.organizationSize || '',
-          companyAddress: job.companyAddress || { city: '', state: '', country: 'India' },
-          // Nested company object (for frontend edit page compatibility)
+          organizationSize: job.organizationSize || "",
+          companyAddress: job.companyAddress || { city: "", state: "", country: "India" },
           company: {
             establishedYear: job.establishedYear || null,
-            organizationSize: job.organizationSize || '',
+            organizationSize: job.organizationSize || "",
             address: job.companyAddress || {},
           },
           location: job.location,
@@ -457,7 +523,7 @@ const getJobById = async (req, res) => {
           salary: job.salary,
           salaryRange: job.salaryRange,
           experience: job.experience,
-          noticePeriod: job.noticePeriod || '',
+          noticePeriod: job.noticePeriod || "",
           skills: job.skills,
           jobType: job.jobType,
           workMode: job.workMode,
@@ -476,6 +542,14 @@ const getJobById = async (req, res) => {
           noPaymentInvolved: job.noPaymentInvolved,
           applicationUrl: job.applicationUrl,
           status: job.status,
+          isActive: job.isActive,
+          approvalStatus: job.approvalStatus,
+          submittedForReviewAt: job.submittedForReviewAt,
+          approvedAt: job.approvedAt,
+          approvedBy: job.approvedBy,
+          rejectionReason: job.rejectionReason,
+          reviewNotes: job.reviewNotes,
+          lastEditedAfterApproval: job.lastEditedAfterApproval,
           featured: job.featured,
           isNew: job.isNew,
           isCompanyVerified: job.isCompanyVerified,
@@ -498,7 +572,10 @@ const getJobById = async (req, res) => {
   }
 };
 
+// ═══════════════════════════════════════════════════════════════
 // @desc    Update a job
+// @route   PUT /api/v1/jobs/:id
+// ═══════════════════════════════════════════════════════════════
 const updateJob = async (req, res) => {
   try {
     const job = await Job.findById(req.params.id);
@@ -508,6 +585,8 @@ const updateJob = async (req, res) => {
       return res.status(403).json({ success: false, message: "Not authorized to update this job" });
     }
 
+    const user = req.authUser || req.admin;
+    const isAuthorizedAdmin = isAnyAdmin(req);
     const body = { ...req.body };
 
     if (body.location && typeof body.location === "string") body.location = safeParseJSON(body.location, {});
@@ -564,7 +643,6 @@ const updateJob = async (req, res) => {
     body.contactVisibility = visibility;
     body.whatsappContactEnabled = visibility.whatsapp;
 
-    // ─── EXTRACT COMPANY INFO (support both nested & flat frontend updates) ───
     if (body.establishedYear !== undefined || body.company?.establishedYear !== undefined) {
       const raw = body.establishedYear ?? body.company?.establishedYear;
       body.establishedYear = raw ? Number(raw) : undefined;
@@ -576,7 +654,6 @@ const updateJob = async (req, res) => {
       body.industry = body.industry ?? body.company?.industry ?? "";
     }
 
-    // ─── COMPANY ADDRESS ───
     if (body.companyAddress || body.companyAddressCity || body.companyAddressState || body.companyAddressCountry) {
       body.companyAddress = {
         city: body.companyAddress?.city || body.companyAddressCity || job.companyAddress?.city || "",
@@ -585,18 +662,20 @@ const updateJob = async (req, res) => {
       };
     }
 
-    // ─── NOTICE PERIOD ───
     if (body.noticePeriod !== undefined) {
       body.noticePeriod = String(body.noticePeriod).trim();
     }
 
-    // ─── RECRUITER CONTACT PERSON Normalization ───
     body.contactPerson = {
       name: body.contactPerson?.name || body.recruiterName || job.contactPerson?.name || "",
       designation: body.contactPerson?.designation || body.recruiterDesignation || job.contactPerson?.designation || "",
     };
 
-    // Clean up transient properties to prevent MongoDB structural errors
+    // If recruiter edits an already approved job, flag it for review
+    if (!isAuthorizedAdmin && job.approvalStatus === "approved") {
+      body.lastEditedAfterApproval = true;
+    }
+
     delete body.company;
     delete body.companyAddressCity;
     delete body.companyAddressState;
@@ -605,7 +684,7 @@ const updateJob = async (req, res) => {
     delete body.recruiterDesignation;
     delete body.description;
 
-    // ========== CLOUDINARY UPLOADS ON UPDATE ==========
+    // Cloudinary Updates
     if (req.files && req.files.logo && req.files.logo[0]) {
       if (job.companyLogo && job.companyLogo.publicId) {
         await deleteFromCloudinary(job.companyLogo.publicId).catch(() => {});
@@ -630,7 +709,6 @@ const updateJob = async (req, res) => {
       }
     }
 
-    // Preserve existing images during edit submit
     if (body.existingImages) {
       const existingImgs = typeof body.existingImages === "string"
         ? safeParseJSON(body.existingImages, [])
@@ -686,37 +764,30 @@ const updateJob = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// @desc    Delete a job (SAFE — protects shared Cloudinary assets)
+// @desc    Delete a job (Protected & safe asset deletion)
 // @route   DELETE /api/v1/jobs/:id
 // ═══════════════════════════════════════════════════════════════
 const deleteJob = async (req, res) => {
   try {
     const job = await Job.findById(req.params.id);
-    if (!job) {
-      return res.status(404).json({ success: false, message: "Job not found" });
-    }
+    if (!job) return res.status(404).json({ success: false, message: "Job not found" });
 
     if (!canManageJob(req, job)) {
       return res.status(403).json({ success: false, message: "Not authorized to delete this job" });
     }
 
-    // ─── Step 1: Collect all Cloudinary publicIds from THIS job ───
     const jobAssetPublicIds = [];
-    if (job.companyLogo?.publicId) {
-      jobAssetPublicIds.push(job.companyLogo.publicId);
-    }
+    if (job.companyLogo?.publicId) jobAssetPublicIds.push(job.companyLogo.publicId);
     if (Array.isArray(job.companyImages)) {
       job.companyImages.forEach((img) => {
         if (img.publicId) jobAssetPublicIds.push(img.publicId);
       });
     }
 
-    // ─── Step 2: Find which assets are shared with OTHER jobs ───
     const sharedPublicIds = new Set();
-
     if (jobAssetPublicIds.length > 0) {
       try {
-        const otherJobsUsingAssets = await Job.find({
+        const otherJobs = await Job.find({
           _id: { $ne: job._id },
           $or: [
             { "companyLogo.publicId": { $in: jobAssetPublicIds } },
@@ -724,113 +795,45 @@ const deleteJob = async (req, res) => {
           ],
         }).select("companyLogo companyImages");
 
-        otherJobsUsingAssets.forEach((otherJob) => {
-          if (otherJob.companyLogo?.publicId && jobAssetPublicIds.includes(otherJob.companyLogo.publicId)) {
-            sharedPublicIds.add(otherJob.companyLogo.publicId);
+        otherJobs.forEach((oj) => {
+          if (oj.companyLogo?.publicId && jobAssetPublicIds.includes(oj.companyLogo.publicId)) {
+            sharedPublicIds.add(oj.companyLogo.publicId);
           }
-          if (Array.isArray(otherJob.companyImages)) {
-            otherJob.companyImages.forEach((img) => {
+          if (Array.isArray(oj.companyImages)) {
+            oj.companyImages.forEach((img) => {
               if (img.publicId && jobAssetPublicIds.includes(img.publicId)) {
                 sharedPublicIds.add(img.publicId);
               }
             });
           }
         });
-      } catch (shareErr) {
-        console.warn(`⚠️ Could not check shared assets across jobs: ${shareErr.message}`);
+      } catch (err) {
+        console.warn("Shared asset check skipped:", err.message);
       }
     }
-
-    // ─── Step 3: Check recruiter's profile for shared assets ───
-    try {
-      if (job.recruiterId) {
-        const recruiter = await Recruiter.findById(job.recruiterId)
-          .select("companyProfile companyLogo companyImages")
-          .lean();
-
-        if (recruiter) {
-          // Check recruiter profile logo (multiple possible field locations)
-          const profileLogoId =
-            recruiter.companyProfile?.logo?.publicId ||
-            recruiter.companyLogo?.publicId;
-          if (profileLogoId && jobAssetPublicIds.includes(profileLogoId)) {
-            sharedPublicIds.add(profileLogoId);
-          }
-
-          // Check recruiter profile gallery
-          const profileGallery =
-            recruiter.companyProfile?.gallery ||
-            recruiter.companyImages ||
-            [];
-          if (Array.isArray(profileGallery)) {
-            profileGallery.forEach((g) => {
-              if (g.publicId && jobAssetPublicIds.includes(g.publicId)) {
-                sharedPublicIds.add(g.publicId);
-              }
-            });
-          }
-        }
-      }
-    } catch (recruiterErr) {
-      // Non-fatal: if recruiter lookup fails, proceed with caution
-      console.warn(
-        `⚠️ Could not check recruiter profile for shared assets: ${recruiterErr.message}`
-      );
-    }
-
-    // ─── Step 4: Delete ONLY non-shared assets from Cloudinary ───
-    const deletedAssets = [];
-    const skippedAssets = [];
 
     for (const publicId of jobAssetPublicIds) {
-      if (sharedPublicIds.has(publicId)) {
-        console.log(
-          `ℹ️ Skipping shared asset deletion (used by other jobs/profile): [${publicId}]`
-        );
-        skippedAssets.push(publicId);
-        continue;
-      }
-
-      try {
-        await deleteFromCloudinary(publicId);
-        deletedAssets.push(publicId);
-        console.log(`✅ Deleted Cloudinary asset: [${publicId}]`);
-      } catch (cloudErr) {
-        // Non-fatal: log but don't block DB deletion
-        console.warn(
-          `⚠️ Cloudinary deletion failed for [${publicId}]: ${cloudErr.message}`
-        );
+      if (!sharedPublicIds.has(publicId)) {
+        await deleteFromCloudinary(publicId).catch(() => {});
       }
     }
 
-    // ─── Step 5: Delete the job document from MongoDB ───
     await Job.findByIdAndDelete(req.params.id);
-
-    console.log(
-      `🗑️ Job deleted: "${job.title}" [${job._id}] | Assets deleted: ${deletedAssets.length}, Skipped (shared): ${skippedAssets.length}`
-    );
 
     res.status(200).json({
       success: true,
       message: "Job deleted successfully",
-      data: {
-        deletedAssets: deletedAssets.length,
-        skippedSharedAssets: skippedAssets.length,
-      },
     });
   } catch (error) {
     console.error("Delete Job Error:", error.message);
-    res.status(500).json({
-      success: false,
-      message: "Server error while deleting job",
-    });
+    res.status(500).json({ success: false, message: "Server error while deleting job" });
   }
 };
 
-// @desc    Approve job
-// ═══════════════════════════════════════════════════════════
-// REPLACE your existing approveJob with this enhanced version
-// ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// @desc    Approve job (Admin action -> Makes job Live for Candidates)
+// @route   POST or PATCH /api/v1/jobs/:id/approve
+// ═══════════════════════════════════════════════════════════════
 const approveJob = async (req, res) => {
   try {
     const job = await Job.findById(req.params.id);
@@ -843,23 +846,19 @@ const approveJob = async (req, res) => {
     const adminUser = req.authUser || req.admin;
     const adminName = adminUser?.name || adminUser?.email || "Admin";
 
-    // Update job status
     job.status = "Live";
     job.isActive = true;
-    job.postedAt = new Date();
-    job.isNew = true;
-
-    // ✅ NEW: Update approval tracking fields
     job.approvalStatus = "approved";
+    job.postedAt = new Date();
     job.approvedAt = new Date();
     job.approvedBy = adminName;
     job.rejectionReason = "";
-    job.reviewNotes = req.body.notes || "";
+    job.reviewNotes = req.body.notes || req.body.reviewNotes || "";
     job.lastEditedAfterApproval = false;
 
     await job.save();
 
-    // ✅ Send email notification to recruiter (non-blocking)
+    // Send email notification to recruiter
     try {
       const mailer = require("../utils/mailer");
       if (job.recruiterEmail && mailer && mailer.sendMail) {
@@ -869,29 +868,26 @@ const approveJob = async (req, res) => {
           html: `
             <div style="font-family:Arial,sans-serif;max-width:500px;margin:0 auto;padding:20px;">
               <h2 style="color:#16a34a;">🎉 Job Approved!</h2>
-              <p>Hi Recruiter,</p>
-              <p>Your job posting <strong>"${job.title}"</strong> at <strong>${job.companyName}</strong> has been <strong style="color:#16a34a;">approved</strong> and is now <strong>live</strong> on the platform.</p>
-              <p>Candidates can now see and apply to this job.</p>
+              <p>Your job posting <strong>"${job.title}"</strong> at <strong>${job.companyName}</strong> has been <strong style="color:#16a34a;">approved</strong> and is now <strong>live</strong> for candidates.</p>
               ${req.body.notes ? `<p style="color:#666;"><em>Admin notes: ${req.body.notes}</em></p>` : ""}
               <p style="color:#999;font-size:12px;">Approved by: ${adminName} • ${new Date().toLocaleString()}</p>
             </div>
           `,
-        }).catch((e) => console.warn("⚠️ Approval email failed:", e.message));
+        }).catch((e) => console.warn("Approval email warning:", e.message));
       }
     } catch (emailErr) {
-      console.warn("⚠️ Could not send approval email:", emailErr.message);
+      console.warn("Could not send approval email:", emailErr.message);
     }
-
-    console.log(`✅ Job approved: "${job.title}" [${job._id}] by ${adminName}`);
 
     res.status(200).json({
       success: true,
-      message: "Job approved and is now live",
+      message: "Job approved successfully and is now Live for candidates.",
       data: {
         _id: job._id,
         title: job.title,
         status: job.status,
         approvalStatus: job.approvalStatus,
+        isActive: job.isActive,
         approvedAt: job.approvedAt,
         approvedBy: job.approvedBy,
       },
@@ -902,9 +898,10 @@ const approveJob = async (req, res) => {
   }
 };
 
-// ═══════════════════════════════════════════════════════════
-// REPLACE your existing rejectJob with this enhanced version
-// ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// @desc    Reject job (Admin action)
+// @route   POST or PATCH /api/v1/jobs/:id/reject
+// ═══════════════════════════════════════════════════════════════
 const rejectJob = async (req, res) => {
   try {
     const job = await Job.findById(req.params.id);
@@ -924,8 +921,6 @@ const rejectJob = async (req, res) => {
 
     job.status = "Rejected";
     job.isActive = false;
-
-    // ✅ NEW: Update approval tracking fields
     job.approvalStatus = "rejected";
     job.rejectionReason = reason.trim();
     job.reviewNotes = req.body.notes || "";
@@ -934,7 +929,6 @@ const rejectJob = async (req, res) => {
 
     await job.save();
 
-    // ✅ Send email notification to recruiter (non-blocking)
     try {
       const mailer = require("../utils/mailer");
       if (job.recruiterEmail && mailer && mailer.sendMail) {
@@ -943,28 +937,24 @@ const rejectJob = async (req, res) => {
           subject: `❌ Your Job "${job.title}" Was Not Approved`,
           html: `
             <div style="font-family:Arial,sans-serif;max-width:500px;margin:0 auto;padding:20px;">
-              <h2 style="color:#dc2626;">Job Not Approved</h2>
-              <p>Hi Recruiter,</p>
+              <h2 style="color:#dc2626;">Job Listing Needs Updates</h2>
               <p>Your job posting <strong>"${job.title}"</strong> at <strong>${job.companyName}</strong> was <strong style="color:#dc2626;">not approved</strong>.</p>
               <div style="background:#fef2f2;border-left:4px solid #dc2626;padding:12px;margin:16px 0;border-radius:4px;">
                 <strong>Reason:</strong> ${reason}
               </div>
-              <p>Please fix the issues and resubmit your job posting.</p>
-              ${req.body.notes ? `<p style="color:#666;"><em>Additional notes: ${req.body.notes}</em></p>` : ""}
+              <p>Please edit the listing in your dashboard and resubmit for approval.</p>
               <p style="color:#999;font-size:12px;">Reviewed by: ${adminName} • ${new Date().toLocaleString()}</p>
             </div>
           `,
-        }).catch((e) => console.warn("⚠️ Rejection email failed:", e.message));
+        }).catch((e) => console.warn("Rejection email warning:", e.message));
       }
     } catch (emailErr) {
-      console.warn("⚠️ Could not send rejection email:", emailErr.message);
+      console.warn("Could not send rejection email:", emailErr.message);
     }
-
-    console.log(`❌ Job rejected: "${job.title}" [${job._id}] by ${adminName} — Reason: ${reason}`);
 
     res.status(200).json({
       success: true,
-      message: "Job has been rejected",
+      message: "Job rejected successfully",
       data: {
         _id: job._id,
         title: job.title,
@@ -979,9 +969,10 @@ const rejectJob = async (req, res) => {
   }
 };
 
-// ═══════════════════════════════════════════════════════════
-// ✅ NEW: Suspend a live job (admin can pull it down anytime)
-// ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// @desc    Suspend job
+// @route   POST or PATCH /api/v1/jobs/:id/suspend
+// ═══════════════════════════════════════════════════════════════
 const suspendJob = async (req, res) => {
   try {
     const job = await Job.findById(req.params.id);
@@ -991,35 +982,120 @@ const suspendJob = async (req, res) => {
       return res.status(403).json({ success: false, message: "Access denied. Admin role required." });
     }
 
-    const adminUser = req.authUser || req.admin;
-    const adminName = adminUser?.name || adminUser?.email || "Admin";
-    const reason = req.body.reason || "Suspended by admin for policy review";
-
+    const reason = req.body.reason || "Suspended by admin";
     job.status = "Closed";
     job.isActive = false;
     job.approvalStatus = "suspended";
     job.rejectionReason = reason;
-    job.reviewNotes = req.body.notes || "";
 
     await job.save();
 
-    console.log(`🚫 Job suspended: "${job.title}" [${job._id}] by ${adminName}`);
-
     res.status(200).json({
       success: true,
-      message: "Job has been suspended",
-      data: {
-        _id: job._id,
-        title: job.title,
-        status: job.status,
-        approvalStatus: job.approvalStatus,
-      },
+      message: "Job suspended successfully",
+      data: job,
     });
   } catch (error) {
     console.error("Suspend Job Error:", error.message);
     res.status(500).json({ success: false, message: "Server error while suspending job" });
   }
 };
+
+// ═══════════════════════════════════════════════════════════════
+// @desc    Toggle featured status
+// @route   PATCH /api/v1/jobs/:id/feature or toggle-feature
+// ═══════════════════════════════════════════════════════════════
+const toggleFeature = async (req, res) => {
+  try {
+    const job = await Job.findById(req.params.id);
+    if (!job) return res.status(404).json({ success: false, message: "Job not found" });
+
+    if (!isAnyAdmin(req)) {
+      return res.status(403).json({ success: false, message: "Access denied" });
+    }
+
+    job.featured = !job.featured;
+    await job.save();
+
+    res.status(200).json({
+      success: true,
+      message: `Job is now ${job.featured ? "Featured" : "Standard"}`,
+      data: { _id: job._id, featured: job.featured },
+    });
+  } catch (error) {
+    console.error("Toggle Feature Error:", error.message);
+    res.status(500).json({ success: false, message: "Server error toggling feature" });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════
+// @desc    Toggle status (Live <-> Closed)
+// @route   PATCH /api/v1/jobs/:id/status or toggle-status
+// ═══════════════════════════════════════════════════════════════
+const toggleStatus = async (req, res) => {
+  try {
+    const job = await Job.findById(req.params.id);
+    if (!job) return res.status(404).json({ success: false, message: "Job not found" });
+
+    if (!canManageJob(req, job)) {
+      return res.status(403).json({ success: false, message: "Not authorized" });
+    }
+
+    if (job.status === "Live") {
+      job.status = "Closed";
+      job.isActive = false;
+    } else {
+      job.status = "Live";
+      job.isActive = true;
+      job.approvalStatus = "approved";
+    }
+
+    await job.save();
+
+    res.status(200).json({
+      success: true,
+      message: `Job status updated to ${job.status}`,
+      data: { _id: job._id, status: job.status, isActive: job.isActive },
+    });
+  } catch (error) {
+    console.error("Toggle Status Error:", error.message);
+    res.status(500).json({ success: false, message: "Server error toggling status" });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════
+// @desc    Update contact visibility
+// @route   PATCH /api/v1/jobs/:id/visibility or contact-visibility
+// ═══════════════════════════════════════════════════════════════
+const updateContactVisibility = async (req, res) => {
+  try {
+    const job = await Job.findById(req.params.id);
+    if (!job) return res.status(404).json({ success: false, message: "Job not found" });
+
+    if (!canManageJob(req, job)) {
+      return res.status(403).json({ success: false, message: "Not authorized" });
+    }
+
+    const { whatsapp, mobile } = req.body;
+    job.contactVisibility = {
+      whatsapp: whatsapp !== undefined ? !!whatsapp : job.contactVisibility.whatsapp,
+      mobile: mobile !== undefined ? !!mobile : job.contactVisibility.mobile,
+    };
+    job.whatsappContactEnabled = job.contactVisibility.whatsapp;
+
+    await job.save();
+
+    res.status(200).json({
+      success: true,
+      message: "Contact visibility updated successfully",
+      data: job.contactVisibility,
+    });
+  } catch (error) {
+    console.error("Update Contact Visibility Error:", error.message);
+    res.status(500).json({ success: false, message: "Server error updating visibility" });
+  }
+};
+
 module.exports = {
   createJob,
   getJobs,
@@ -1028,6 +1104,7 @@ module.exports = {
   deleteJob,
   approveJob,
   rejectJob,
+  suspendJob,
   toggleFeature,
   toggleStatus,
   updateContactVisibility,

@@ -16,14 +16,25 @@ const jobSchema = new mongoose.Schema(
     companyId: { type: mongoose.Schema.Types.ObjectId, ref: "Company", index: true },
     companyName: { type: String, required: true, trim: true },
     companyWebsite: {
-      type: String, trim: true,
-      validate: { validator: function (v) { if (!v) return true; return /^https?:\/\/.+\..+/.test(v); }, message: "Please provide a valid URL" },
+      type: String,
+      trim: true,
+      validate: {
+        validator: function (v) {
+          if (!v) return true;
+          return /^https?:\/\/.+\..+/.test(v);
+        },
+        message: "Please provide a valid URL",
+      },
     },
     companyLogo: imageSchema,
     companyImages: [imageSchema],
     companyInitials: { type: String, trim: true, maxlength: 4 },
     industry: { type: String, trim: true },
-    establishedYear: { type: Number, min: [1800, "Established year must be after 1800"], max: [new Date().getFullYear(), "Established year cannot be in the future"] },
+    establishedYear: {
+      type: Number,
+      min: [1800, "Established year must be after 1800"],
+      max: [new Date().getFullYear(), "Established year cannot be in the future"],
+    },
     organizationSize: { type: String, trim: true },
     companyAddress: {
       city: { type: String, trim: true },
@@ -48,7 +59,11 @@ const jobSchema = new mongoose.Schema(
       text: { type: String, trim: true },
     },
     noticePeriod: { type: String, trim: true },
-    jobType: { type: String, enum: ["Full-Time", "Part-Time", "Contract", "Internship", "Freelance", "Temporary"], default: "Full-Time" },
+    jobType: {
+      type: String,
+      enum: ["Full-Time", "Part-Time", "Contract", "Internship", "Freelance", "Temporary"],
+      default: "Full-Time",
+    },
     workMode: { type: String, enum: ["On-site", "Remote", "Hybrid"], default: "On-site" },
     department: { type: String, trim: true },
     role: { type: String, trim: true },
@@ -61,30 +76,44 @@ const jobSchema = new mongoose.Schema(
     benefits: [{ type: String, trim: true }],
     jobTiming: { type: String, trim: true },
     workingDays: { type: String, trim: true },
-    contactPerson: { name: { type: String, trim: true }, designation: { type: String, trim: true } },
+    contactPerson: {
+      name: { type: String, trim: true },
+      designation: { type: String, trim: true },
+    },
     recruiterWhatsappNumber: { type: String, trim: true },
     recruiterMobileNumber: { type: String, trim: true },
     recruiterEmail: { type: String, trim: true, lowercase: true },
     applicationUrl: {
-      type: String, trim: true,
-      validate: { validator: function (v) { if (!v) return true; return /^https?:\/\/.+\..+/.test(v); }, message: "Please provide a valid application URL" },
+      type: String,
+      trim: true,
+      validate: {
+        validator: function (v) {
+          if (!v) return true;
+          return /^https?:\/\/.+\..+/.test(v);
+        },
+        message: "Please provide a valid application URL",
+      },
     },
     noPaymentInvolved: { type: Boolean, default: true },
-    contactVisibility: { whatsapp: { type: Boolean, default: false }, mobile: { type: Boolean, default: false } },
+    contactVisibility: {
+      whatsapp: { type: Boolean, default: false },
+      mobile: { type: Boolean, default: false },
+    },
     whatsappContactEnabled: { type: Boolean, default: false },
 
+    // Status workflow
     status: {
       type: String,
       enum: ["Draft", "Pending Approval", "Live", "Rejected", "Expired", "Closed"],
       default: "Pending Approval",
       index: true,
     },
-    isActive: { type: Boolean, default: true },
+    isActive: { type: Boolean, default: false, index: true },
     featured: { type: Boolean, default: false },
     isNew: { type: Boolean, default: true },
     isCompanyVerified: { type: Boolean, default: false },
 
-    // ✅ NEW: Approval tracking fields
+    // Approval tracking fields
     approvalStatus: {
       type: String,
       enum: ["pending_review", "approved", "rejected", "suspended"],
@@ -105,8 +134,7 @@ const jobSchema = new mongoose.Schema(
   { timestamps: true, suppressReservedKeysWarning: true }
 );
 
-jobSchema.index({ status: 1, createdAt: -1 });
-jobSchema.index({ approvalStatus: 1, createdAt: -1 });
+jobSchema.index({ status: 1, approvalStatus: 1, isActive: 1, createdAt: -1 });
 jobSchema.index({ recruiterId: 1, status: 1 });
 jobSchema.index({ companyId: 1, status: 1 });
 jobSchema.index({ "location.city": 1, status: 1 });
@@ -115,7 +143,9 @@ jobSchema.index({ skills: 1 });
 jobSchema.virtual("salaryRange").get(function () {
   if (!this.salary || (!this.salary.min && !this.salary.max)) return "Not Disclosed";
   const currency = this.salary.currency === "INR" ? "₹" : this.salary.currency;
-  if (this.salary.min && this.salary.max) return `${currency}${this.salary.min.toLocaleString()} - ${currency}${this.salary.max.toLocaleString()}`;
+  if (this.salary.min && this.salary.max) {
+    return `${currency}${this.salary.min.toLocaleString()} - ${currency}${this.salary.max.toLocaleString()}`;
+  }
   if (this.salary.min) return `${currency}${this.salary.min.toLocaleString()}+`;
   return `Up to ${currency}${this.salary.max.toLocaleString()}`;
 });
@@ -127,12 +157,12 @@ jobSchema.virtual("locationDisplay").get(function () {
 
 jobSchema.virtual("postedDate").get(function () {
   if (!this.postedAt) return "";
-  const days = Math.floor((Date.now() - this.postedAt) / (1000 * 60 * 60 * 24));
+  const days = Math.floor((Date.now() - new Date(this.postedAt).getTime()) / (1000 * 60 * 60 * 24));
   if (days === 0) return "Today";
   if (days === 1) return "Yesterday";
   if (days < 7) return `${days}d ago`;
   if (days < 30) return `${Math.floor(days / 7)}w ago`;
-  return this.postedAt.toLocaleDateString();
+  return new Date(this.postedAt).toLocaleDateString();
 });
 
 jobSchema.set("toJSON", { virtuals: true });

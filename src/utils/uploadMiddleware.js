@@ -1,3 +1,4 @@
+// FILE: backend/src/utils/uploadMiddleware.js
 const multer = require("multer");
 
 const storage = multer.memoryStorage();
@@ -24,6 +25,14 @@ const imageFileFilter = (req, file, cb) => {
   }
 };
 
+// Generic multer instance with generous defaults
+const upload = multer({
+  storage,
+  fileFilter: imageFileFilter,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB limit
+});
+
+// Specific pre-configured helper middlewares (for backward compatibility)
 const uploadLogo = multer({
   storage,
   fileFilter: imageFileFilter,
@@ -51,9 +60,13 @@ const uploadProfileImage = multer({
   limits: { fileSize: 5 * 1024 * 1024 },
 }).single("profileImage");
 
-module.exports = {
-  uploadLogo,
-  uploadImages,
-  uploadCompanyFiles,
-  uploadProfileImage,
-};
+// Attach helpers directly as properties of the main 'upload' function
+upload.uploadLogo = uploadLogo;
+upload.uploadImages = uploadImages;
+upload.uploadCompanyFiles = uploadCompanyFiles;
+upload.uploadProfileImage = uploadProfileImage;
+
+// Exporting the function object allows BOTH:
+// 1. const upload = require('./uploadMiddleware') -> upload.fields(...) works!
+// 2. const { uploadLogo } = require('./uploadMiddleware') -> Destructuring still works!
+module.exports = upload;
