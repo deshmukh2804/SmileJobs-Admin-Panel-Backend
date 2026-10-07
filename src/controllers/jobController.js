@@ -483,8 +483,16 @@ const getJobs = async (req, res) => {
 
     const [jobs, total] = await Promise.all([
       Job.find(filter)
-        .populate("recruiterId", "name email phone mobile companyName isVerified designation")
-        .populate("companyId", "name logo website verified industry")
+        .populate({
+          path: "recruiterId",
+          model: Recruiter, // Direct Mongoose model injection bypasses connection registries
+          select: "name email phone mobile companyName isVerified designation"
+        })
+        .populate({
+          path: "companyId",
+          model: Company, // Direct Mongoose model injection bypasses connection registries
+          select: "name logo website verified industry"
+        })
         .sort(sort)
         .skip(skip)
         .limit(parseInt(limit)),
@@ -531,8 +539,16 @@ const getJobs = async (req, res) => {
 const getJobById = async (req, res) => {
   try {
     const job = await Job.findById(req.params.id)
-      .populate("recruiterId", "name email phone mobile companyName isVerified designation")
-      .populate("companyId", "name logo website verified industry");
+      .populate({
+        path: "recruiterId",
+        model: Recruiter, // Direct Mongoose model injection
+        select: "name email phone mobile companyName isVerified designation"
+      })
+      .populate({
+        path: "companyId",
+        model: Company, // Direct Mongoose model injection
+        select: "name logo website verified industry"
+      });
 
     if (!job) return res.status(404).json({ success: false, message: "Job not found" });
 
