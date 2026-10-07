@@ -353,7 +353,7 @@ const createJob = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// @desc    Get all jobs (Now with optional JWT decoding for public route)
+// @desc    Get all jobs (Admin panel queue, recruiter panel & candidates)
 // @route   GET /api/v1/jobs
 // ═══════════════════════════════════════════════════════════════
 const getJobs = async (req, res) => {
@@ -371,81 +371,96 @@ const getJobs = async (req, res) => {
       sort = "-createdAt",
     } = req.query;
 
-    // ─── OPTIONAL JWT PARSING FOR THE PUBLIC ROUTE ───
+    // ─── ROBUST DECODER FOR PUBLIC ENDPOINTS ───
     let user = req.authUser || req.admin;
-    if (!user && req.headers.authorization && req.headers.authorization.startsWith("Bearer")) {
-      try {
-        const token = req.headers.authorization.split(" ")[1];
-        const secrets = [
-          process.env.JWT_SECRET,
-          process.env.JWT_ADMIN_SECRET,
-          process.env.ADMIN_JWT_SECRET,
-          process.env.JWT_ACCESS_SECRET,
-          "careerflow_secret"
-        ].filter(Boolean);
+    let isAllowedToAccessUnpublished = false;
+    let isRecruiterUser = false;
 
-        for (const secret of secrets) {
-          try {
-            const decoded = jwt.verify(token, secret);
-            if (decoded) {
-              user = decoded;
-              req.authUser = decoded; // Populate on req for consistency
-              break;
-            }
-          } catch (e) {
-            // Keep trying next secret
-          }
-        }
+    const authHeader = req.headers.authorization || req.headers.Authorization;
+    if (authHeader && authHeader.toLowerCase().startsWith("bearer ")) {
+      const token = authHeader.split(" ")[1];
+      const secrets = [
+        process.env.JWT_SECRET,
+        process.env.JWT_ADMIN_SECRET,
+        process.env.ADMIN_JWT_SECRET,
+        process.env.JWT_ACCESS_SECRET,
+        "careerflow_secret"
+      ].filter(Boolean);
 
-        // Development fallback: non-verifying decode
-        if (!user && process.env.NODE_ENV !== 'production') {
-          const decoded = jwt.decode(token);
-          if (decoded) {
-            user = decoded;
-            req.authUser = decoded;
-          }
+      let decoded = null;
+      for (const secret of secrets) {
+        try {
+          decoded = jwt.verify(token, secret);
+          if (decoded) break;
+        } catch (e) {
+          // try next secret
         }
-      } catch (err) {
-        console.warn("Optional JWT parsing bypassed in getJobs:", err.message);
+      }
+
+      // Safe fallback decode for dev environments
+      if (!decoded) {
+        try {
+          decoded = jwt.decode(token);
+        } catch (e) {
+          // ignore parsing error
+        }
+      }
+
+      if (decoded) {
+        const role = normalizeRole(decoded.role);
+        if (["superadmin", "admin", "moderator", "supportagent", "contentmanager", "financemanager"].includes(role)) {
+          isAllowedToAccessUnpublished = true;
+          user = decoded;
+          req.authUser = decoded;
+        } else if (role === "recruiter") {
+          isRecruiterUser = true;
+          user = decoded;
+          req.authUser = decoded;
+        }
       }
     }
-
-    const isAllowedToAccessUnpublished =
-      user && ["superadmin", "admin", "moderator", "supportagent", "contentmanager", "financemanager"].includes(normalizeRole(user.role));
-    const isRecruiterUser = user && normalizeRole(user.role) === "recruiter";
 
     const filter = {};
 
-    // ── CANDIDATE / PUBLIC CONSUMPTION ──
-    // Candidates MUST ONLY see Live + Approved + Active jobs
-    if (!isAllowedToAccessUnpublished && !isRecruiterUser) {
+    // ── CANDIDATE / RECRUITER / ADMIN FLOW FILTERING ──
+    if (isAllowedToAccessUnpublished) {
+      // ✅ Admin Flow: Show exactly what is requested (handles 'Live' with 'pending_review' legacy documents)
+      if (status && status !== "All") {
+        if (status === "Pending" || status === "Pending Approval" || status === "pending_review") {
+          filter.$or = [
+            { status: "Pending Approval" },
+            { approvalStatus: "pending_review" },
+          ];
+        } else if (status === "Approved" || status === "Live") {
+          filter.status = "Live";
+          filter.approvalStatus = "approved";
+        } else {
+          filter.status = status;
+        }
+      }
+      if (approvalStatus && approvalStatus !== "All") {
+        filter.approvalStatus = approvalStatus;
+      }
+    } else if (isRecruiterUser) {
+      // ✅ Recruiter Flow: Only show their own posts
+      const userId = user.id || user.adminId || user._id;
+      filter.recruiterId = userId;
+
+      if (status && status !== "All") {
+        if (status === "Pending" || status === "Pending Approval" || status === "pending_review") {
+          filter.$or = [
+            { status: "Pending Approval" },
+            { approvalStatus: "pending_review" },
+          ];
+        } else {
+          filter.status = status;
+        }
+      }
+    } else {
+      // ── Candidates: Strict visibility rules ──
       filter.status = "Live";
       filter.approvalStatus = "approved";
       filter.isActive = true;
-    } else if (isRecruiterUser && !isAllowedToAccessUnpublished) {
-      // Recruiter sees their own jobs (all statuses)
-      const userId = user.id || user.adminId || user._id;
-      filter.recruiterId = userId;
-    }
-
-    // ── ADMIN / PARAM FILTERING ──
-    if (status && status !== "All") {
-      // ✅ Matches status: 'Live' with 'pending_review' documents so they display in Admin Approval View!
-      if (status === "Pending" || status === "Pending Approval" || status === "pending_review") {
-        filter.$or = [
-          { status: "Pending Approval" },
-          { approvalStatus: "pending_review" },
-        ];
-      } else if (status === "Approved" || status === "Live") {
-        filter.status = "Live";
-        filter.approvalStatus = "approved";
-      } else {
-        filter.status = status;
-      }
-    }
-
-    if (approvalStatus && approvalStatus !== "All") {
-      filter.approvalStatus = approvalStatus;
     }
 
     if (search) {
