@@ -13,44 +13,38 @@ const {
   toggleFeature,
   toggleStatus,
   updateContactVisibility,
-  getJobStats,
 } = require("../controllers/jobController");
-const { protect, requirePermission } = require("../middleware/authMiddleware");
+const { protect } = require("../middleware/authMiddleware");
 const upload = require("../utils/uploadMiddleware");
 
-// Stats route (Must come before /:id parameter route)
-router.get("/stats", protect, getJobStats);
-
-// Public routes (Candidates and public feed)
+// Public routes (candidate app reads these)
 router.get("/", getJobs);
 router.get("/:id", getJobById);
 
-// Job Creation (Supports multipart logo and gallery uploads)
+// Protected routes
 router.post(
   "/",
   protect,
   upload.fields([
     { name: "logo", maxCount: 1 },
-    { name: "images", maxCount: 10 },
+    { name: "images", maxCount: 5 },
   ]),
   createJob
 );
 
-// Job Update
 router.put(
   "/:id",
   protect,
   upload.fields([
     { name: "logo", maxCount: 1 },
-    { name: "images", maxCount: 10 },
+    { name: "images", maxCount: 5 },
   ]),
   updateJob
 );
 
-// Job Deletion
 router.delete("/:id", protect, deleteJob);
 
-// Admin Approval Routes (Supports both POST & PATCH to guarantee frontend compatibility)
+// Admin approval routes (Accepts both POST & PATCH to prevent front-end errors)
 router.post("/:id/approve", protect, approveJob);
 router.patch("/:id/approve", protect, approveJob);
 
@@ -60,7 +54,7 @@ router.patch("/:id/reject", protect, rejectJob);
 router.post("/:id/suspend", protect, suspendJob);
 router.patch("/:id/suspend", protect, suspendJob);
 
-// Admin Action Toggles
+// Admin management routes
 router.patch("/:id/feature", protect, toggleFeature);
 router.patch("/:id/toggle-feature", protect, toggleFeature);
 
