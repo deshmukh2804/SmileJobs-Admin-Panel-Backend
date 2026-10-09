@@ -1,184 +1,209 @@
 const mongoose = require("mongoose");
-const { jobDbConnection } = require("../config/db");
-
-const imageSchema = new mongoose.Schema(
-  {
-    url: { type: String, required: true },
-    publicId: { type: String, required: true },
-  },
-  { _id: false }
-);
 
 const jobSchema = new mongoose.Schema(
   {
-    title: { type: String, required: [true, "Job title is required"], trim: true, index: true },
-    recruiterId: { type: mongoose.Schema.Types.ObjectId, ref: "Recruiter", required: true, index: true },
-    companyId: { type: mongoose.Schema.Types.ObjectId, ref: "Company", index: true },
-    companyName: { type: String, required: true, trim: true },
+    title: {
+      type: String,
+      required: [true, "Job title is required"],
+      trim: true,
+      maxlength: [150, "Job title cannot exceed 150 characters"],
+      index: true
+    },
+    recruiterId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Recruiter",
+      required: false,
+      default: null,
+      index: true
+    },
+    companyName: {
+      type: String,
+      required: [true, "Company name is required"],
+      trim: true,
+      index: true
+    },
+    companyLogo: {
+      type: String,
+      default: ""
+    },
     companyWebsite: {
       type: String,
+      default: ""
+    },
+    jobCategory: {
+      type: String,
+      required: [true, "Job category is required"],
       trim: true,
-      validate: {
-        validator: function (v) {
-          if (!v) return true;
-          return /^https?:\/\/.+\..+/.test(v);
-        },
-        message: "Please provide a valid URL",
-      },
+      index: true
     },
-    companyLogo: imageSchema,
-    companyImages: [imageSchema],
-    companyInitials: { type: String, trim: true, maxlength: 4 },
-    industry: { type: String, trim: true },
-    establishedYear: {
-      type: Number,
-      min: [1800, "Established year must be after 1800"],
-      max: [new Date().getFullYear(), "Established year cannot be in the future"],
-    },
-    organizationSize: { type: String, trim: true },
-    companyAddress: {
-      city: { type: String, trim: true },
-      state: { type: String, trim: true },
-      country: { type: String, trim: true, default: "India" },
-    },
-    location: {
-      address: { type: String, trim: true },
-      city: { type: String, trim: true, index: true },
-      state: { type: String, trim: true },
-      country: { type: String, trim: true, default: "India" },
-    },
-    salary: {
-      min: { type: Number, min: [0, "Salary cannot be negative"] },
-      max: { type: Number, min: [0, "Salary cannot be negative"] },
-      currency: { type: String, default: "INR", trim: true },
-      period: { type: String, enum: ["hour", "day", "week", "month", "year"], default: "month" },
-    },
-    experience: {
-      min: { type: Number, min: [0, "Experience cannot be negative"], default: 0 },
-      max: { type: Number, min: [0, "Experience cannot be negative"] },
-      text: { type: String, trim: true },
-    },
-    noticePeriod: { type: String, trim: true },
     jobType: {
       type: String,
-      enum: ["Full-Time", "Part-Time", "Contract", "Internship", "Freelance", "Temporary"],
+      enum: ["Full-Time", "Part-Time", "Contract", "Internship", "Freelance"],
       default: "Full-Time",
+      index: true
     },
-    workMode: { type: String, enum: ["On-site", "Remote", "Hybrid"], default: "On-site" },
-    department: { type: String, trim: true },
-    role: { type: String, trim: true },
-    qualification: { type: String, trim: true },
-    skills: [{ type: String, trim: true }],
-    languages: [{ type: String, trim: true }],
-    jobDescription: { type: String, trim: true },
-    responsibilities: [{ type: String, trim: true }],
-    requirements: [{ type: String, trim: true }],
-    benefits: [{ type: String, trim: true }],
-    jobTiming: { type: String, trim: true },
-    workingDays: { type: String, trim: true },
-    contactPerson: {
-      name: { type: String, trim: true },
-      designation: { type: String, trim: true },
-    },
-    recruiterWhatsappNumber: { type: String, trim: true },
-    recruiterMobileNumber: { type: String, trim: true },
-    recruiterEmail: { type: String, trim: true, lowercase: true },
-    applicationUrl: {
+    workplaceType: {
       type: String,
-      trim: true,
-      validate: {
-        validator: function (v) {
-          if (!v) return true;
-          return /^https?:\/\/.+\..+/.test(v);
-        },
-        message: "Please provide a valid application URL",
+      enum: ["On-site", "Hybrid", "Remote"],
+      default: "On-site"
+    },
+    location: {
+      city: { type: String, default: "" },
+      state: { type: String, default: "" },
+      country: { type: String, default: "India" },
+      address: { type: String, default: "" },
+      coordinates: {
+        latitude: { type: Number, default: null },
+        longitude: { type: Number, default: null }
+      }
+    },
+    vacancies: {
+      type: Number,
+      default: 1,
+      min: 1
+    },
+    experience: {
+      min: { type: Number, default: 0 },
+      max: { type: Number, default: 0 },
+      level: {
+        type: String,
+        enum: ["Fresher", "Junior", "Mid-Level", "Senior", "Lead", "Executive"],
+        default: "Fresher"
+      }
+    },
+    salary: {
+      min: { type: Number, default: 0 },
+      max: { type: Number, default: 0 },
+      currency: { type: String, default: "INR" },
+      period: {
+        type: String,
+        enum: ["Per Hour", "Per Month", "Per Year"],
+        default: "Per Month"
       },
+      isNegotiable: { type: Boolean, default: false },
+      hideSalary: { type: Boolean, default: false }
     },
-    noPaymentInvolved: { type: Boolean, default: true },
-    contactVisibility: {
-      whatsapp: { type: Boolean, default: false },
-      mobile: { type: Boolean, default: false },
+    description: {
+      type: String,
+      required: [true, "Job description is required"]
     },
-    whatsappContactEnabled: { type: Boolean, default: false },
+    responsibilities: [{ type: String }],
+    requirements: [{ type: String }],
+    skills: [{ type: String, index: true }],
+    qualifications: [{ type: String }],
+    benefits: [{ type: String }],
+    applicationDeadline: {
+      type: Date,
+      default: () => new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+    },
+    contactEmail: {
+      type: String,
+      default: ""
+    },
+    contactPhone: {
+      type: String,
+      default: ""
+    },
+    isContactVisible: {
+      type: Boolean,
+      default: true
+    },
 
-    // Status workflow
+    // Job Lifecycle Status
     status: {
       type: String,
       enum: ["Draft", "Pending Approval", "Live", "Rejected", "Expired", "Closed"],
       default: "Pending Approval",
-      index: true,
+      index: true
     },
-    isActive: { type: Boolean, default: false, index: true },
-    featured: { type: Boolean, default: false },
-    isNew: { type: Boolean, default: true },
-    isCompanyVerified: { type: Boolean, default: false },
-
-    // ✅ NEW: Job Source Tracking
-    postedBy: {
-      type: String,
-      enum: ["admin", "recruiter"],
-      default: "recruiter",
-      index: true,
-    },
-    postedByUserId: { type: String, default: "" }, // Stores admin ID or recruiter ID
-    postedByName: { type: String, default: "" },
-    postedByEmail: { type: String, default: "" },
-    postedByRole: { type: String, default: "" },
-
-    // Approval tracking fields
     approvalStatus: {
       type: String,
       enum: ["pending_review", "approved", "rejected", "suspended"],
       default: "pending_review",
-      index: true,
+      index: true
     },
-    submittedForReviewAt: { type: Date, default: Date.now },
-    approvedAt: { type: Date, default: null },
-    approvedBy: { type: String, default: "" },
-    rejectionReason: { type: String, default: "" },
-    reviewNotes: { type: String, default: "" },
-    lastEditedAfterApproval: { type: Boolean, default: false },
+    isActive: {
+      type: Boolean,
+      default: false,
+      index: true
+    },
+    isFeatured: {
+      type: Boolean,
+      default: false,
+      index: true
+    },
+    isUrgent: {
+      type: Boolean,
+      default: false
+    },
 
-    applicantsCount: { type: Number, default: 0 },
-    applicantsCap: { type: Number, default: 100 },
-    postedAt: { type: Date, default: Date.now },
+    // Source tracking: admin vs recruiter
+    postedBy: {
+      type: String,
+      enum: ["admin", "recruiter"],
+      default: "recruiter",
+      index: true
+    },
+    postedByUserId: {
+      type: String,
+      default: null
+    },
+    postedByName: {
+      type: String,
+      default: ""
+    },
+    postedByEmail: {
+      type: String,
+      default: ""
+    },
+    postedByRole: {
+      type: String,
+      default: "recruiter"
+    },
+
+    // Audit fields
+    submittedForReviewAt: {
+      type: Date,
+      default: Date.now
+    },
+    approvedAt: {
+      type: Date,
+      default: null
+    },
+    approvedBy: {
+      type: String,
+      default: null
+    },
+    rejectionReason: {
+      type: String,
+      default: ""
+    },
+    reviewNotes: {
+      type: String,
+      default: ""
+    },
+    lastEditedAfterApproval: {
+      type: Boolean,
+      default: false
+    },
+
+    // Statistics
+    stats: {
+      views: { type: Number, default: 0 },
+      applications: { type: Number, default: 0 },
+      shares: { type: Number, default: 0 },
+      shortlisted: { type: Number, default: 0 }
+    }
   },
-  { timestamps: true, suppressReservedKeysWarning: true }
+  {
+    timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true }
+  }
 );
 
 jobSchema.index({ status: 1, approvalStatus: 1, isActive: 1, createdAt: -1 });
 jobSchema.index({ postedBy: 1, status: 1 });
-jobSchema.index({ recruiterId: 1, status: 1 });
-jobSchema.index({ companyId: 1, status: 1 });
-jobSchema.index({ "location.city": 1, status: 1 });
-jobSchema.index({ skills: 1 });
+jobSchema.index({ title: "text", companyName: "text", description: "text", skills: "text" });
 
-jobSchema.virtual("salaryRange").get(function () {
-  if (!this.salary || (!this.salary.min && !this.salary.max)) return "Not Disclosed";
-  const currency = this.salary.currency === "INR" ? "₹" : this.salary.currency;
-  if (this.salary.min && this.salary.max) {
-    return `${currency}${this.salary.min.toLocaleString()} - ${currency}${this.salary.max.toLocaleString()}`;
-  }
-  if (this.salary.min) return `${currency}${this.salary.min.toLocaleString()}+`;
-  return `Up to ${currency}${this.salary.max.toLocaleString()}`;
-});
-
-jobSchema.virtual("locationDisplay").get(function () {
-  if (!this.location) return "";
-  return [this.location.city, this.location.state, this.location.country].filter(Boolean).join(", ");
-});
-
-jobSchema.virtual("postedDate").get(function () {
-  if (!this.postedAt) return "";
-  const days = Math.floor((Date.now() - new Date(this.postedAt).getTime()) / (1000 * 60 * 60 * 24));
-  if (days === 0) return "Today";
-  if (days === 1) return "Yesterday";
-  if (days < 7) return `${days}d ago`;
-  if (days < 30) return `${Math.floor(days / 7)}w ago`;
-  return new Date(this.postedAt).toLocaleDateString();
-});
-
-jobSchema.set("toJSON", { virtuals: true });
-jobSchema.set("toObject", { virtuals: true });
-
-module.exports = jobDbConnection.model("Job", jobSchema);
+module.exports = mongoose.model("Job", jobSchema);
