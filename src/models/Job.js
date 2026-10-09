@@ -238,11 +238,11 @@ const jobSchema = new mongoose.Schema(
   },
   {
     timestamps: true,
-    collection: "jobs" // ✅ Explicitly binds to 'jobs' collection
+    collection: "jobs"
   }
 );
 
-// Auto-sync virtuals & initials
+// Auto-sync virtuals & initials before saving
 jobSchema.pre("save", function (next) {
   if (this.companyName && !this.companyInitials) {
     this.companyInitials = this.companyName
@@ -261,4 +261,10 @@ jobSchema.pre("save", function (next) {
   next();
 });
 
-module.exports = mongoose.model("Job", jobSchema, "jobs");
+// ════════════════════════════════════════════════════════════════════════
+// CRITICAL CROSS-DATABASE BINDING: Force compile on the "Job_db" Database
+// ════════════════════════════════════════════════════════════════════════
+const targetDb = mongoose.connection.useDb("Job_db", { useCache: true });
+const Job = targetDb.model("Job", jobSchema, "jobs");
+
+module.exports = Job;

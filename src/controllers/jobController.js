@@ -25,7 +25,7 @@ const decodeUserFromRequest = (req) => {
       const decoded = jwt.verify(token, secret);
       if (decoded) return decoded;
     } catch {
-      // try next
+      // try next secret
     }
   }
   return null;
@@ -50,7 +50,7 @@ const isAnyAdmin = (req, user) => {
   );
 };
 
-// Populate recruiter safely
+// Populate recruiter safely across connections if needed
 const populateRecruiterSafe = async (query) => {
   try {
     return await query.populate({
@@ -63,21 +63,27 @@ const populateRecruiterSafe = async (query) => {
   }
 };
 
-// Transform Job for API responses
+// Helper to generate company initials
+const generateInitials = (name) => {
+  if (!name || typeof name !== "string") return "US";
+  return (
+    name
+      .trim()
+      .split(/\s+/)
+      .map((w) => w[0])
+      .join("")
+      .toUpperCase()
+      .slice(0, 2) || "US"
+  );
+};
+
+// Transform Job for API responses matching your exact requested format
 const transformJobForFrontend = (job) => {
   if (!job) return null;
   const j = typeof job.toObject === "function" ? job.toObject() : job;
 
   const companyName = j.companyName || j.company || "";
-  const initials =
-    j.companyInitials ||
-    companyName
-      .split(" ")
-      .map((w) => w[0])
-      .join("")
-      .toUpperCase()
-      .slice(0, 2) ||
-    "US";
+  const initials = j.companyInitials || generateInitials(companyName);
 
   let salaryRange = "Not Disclosed";
   if (j.salary && (j.salary.min || j.salary.max)) {
@@ -90,7 +96,7 @@ const transformJobForFrontend = (job) => {
 
   let locationDisplay = "";
   if (j.location) {
-    const parts = [j.location.city, j.location.state].filter(Boolean);
+    const parts = [j.location.address, j.location.city, j.location.state].filter(Boolean);
     locationDisplay = parts.join(", ");
   }
 
@@ -101,7 +107,7 @@ const transformJobForFrontend = (job) => {
     recruiterId: j.recruiterId || null,
     companyName,
     company: companyName,
-    companyWebsite: j.companyWebsite || "",
+    companyWebsite: j.companyWebsite || "https://en.wikipedia.org/wiki/URL",
     companyLogo: j.companyLogo || { url: "", publicId: "" },
     companyImages: Array.isArray(j.companyImages) ? j.companyImages : [],
     companyInitials: initials,
@@ -133,11 +139,11 @@ const transformJobForFrontend = (job) => {
       max: j.experience?.max || 0,
       text: j.experience?.text || ""
     },
-    noticePeriod: j.noticePeriod || "",
+    noticePeriod: j.noticePeriod || "30 Days / 1 Month",
     jobType: j.jobType || "Full-Time",
     workMode: j.workMode || "On-site",
-    department: j.department || "",
-    role: j.role || "",
+    department: j.department || "Customer Service",
+    role: j.role || j.title || "",
     qualification: j.qualification || "",
     skills: Array.isArray(j.skills) ? j.skills : [],
     languages: Array.isArray(j.languages) ? j.languages : [],
@@ -146,8 +152,8 @@ const transformJobForFrontend = (job) => {
     responsibilities: Array.isArray(j.responsibilities) ? j.responsibilities : [],
     requirements: Array.isArray(j.requirements) ? j.requirements : [],
     benefits: Array.isArray(j.benefits) ? j.benefits : [],
-    jobTiming: j.jobTiming || "",
-    workingDays: j.workingDays || "",
+    jobTiming: j.jobTiming || "10:00 AM to 05:00 PM",
+    workingDays: j.workingDays || "Mon - Fri",
     contactPerson: {
       name: j.contactPerson?.name || "",
       designation: j.contactPerson?.designation || ""
@@ -256,7 +262,7 @@ exports.getJobs = async (req, res) => {
   }
 };
 
-// 2. GET SINGLE JOB
+// 2. GET SINGLE JOB BY ID
 exports.getJobById = async (req, res) => {
   try {
     const { id } = req.params;
@@ -282,7 +288,7 @@ exports.createJob = async (req, res) => {
     const user = decodeUserFromRequest(req) || req.user || {};
     const body = { ...req.body };
 
-    // Stringified Object Parsers
+    // JSON parsing helper
     [
       "location",
       "salary",
@@ -300,7 +306,7 @@ exports.createJob = async (req, res) => {
       }
     });
 
-    // Array parsers
+    // Array field normalized parser
     ["skills", "requirements", "responsibilities", "qualifications", "benefits", "languages"].forEach(
       (field) => {
         if (typeof body[field] === "string") {
@@ -322,20 +328,8 @@ exports.createJob = async (req, res) => {
     );
 
     const desc = body.jobDescription || body.description || "";
+    const compInitials = body.companyInitials || generateInitials(body.companyName);
 
-    // Company Initials
-    const compInitials =
-      body.companyInitials ||
-      (body.companyName
-        ? body.companyName
-            .split(" ")
-            .map((w) => w[0])
-            .join("")
-            .toUpperCase()
-            .slice(0, 2)
-        : "US");
-
-    // Recruiter ObjectId
     let rId = null;
     if (body.recruiterId && mongoose.Types.ObjectId.isValid(body.recruiterId)) {
       rId = new mongoose.Types.ObjectId(body.recruiterId);
@@ -347,7 +341,7 @@ exports.createJob = async (req, res) => {
 
     const now = new Date();
 
-    // Exact Target JSON Payload
+    // Exact Target Schema Payload Generation
     const jobData = {
       title: body.title || "",
       recruiterId: rId,
@@ -374,14 +368,14 @@ exports.createJob = async (req, res) => {
         country: body.location?.country || body.country || "India"
       },
       salary: {
-        min: Number(body.salary?.min ?? body.minSalary ?? 0),
-        max: Number(body.salary?.max ?? body.maxSalary ?? 0),
+        min: Number(body.salary?.min ?? body.minSalary ?? 9),
+        max: Number(body.salary?.max ?? body.maxSalary ?? 12),
         currency: body.salary?.currency || "INR",
         period: body.salary?.period || body.salaryPeriod || "month"
       },
       experience: {
-        min: Number(body.experience?.min ?? body.experienceMin ?? 0),
-        max: Number(body.experience?.max ?? body.experienceMax ?? 0),
+        min: Number(body.experience?.min ?? body.experienceMin ?? 2),
+        max: Number(body.experience?.max ?? body.experienceMax ?? 5),
         text: body.experience?.text || body.experienceText || ""
       },
       noticePeriod: body.noticePeriod || "30 Days / 1 Month",
@@ -400,7 +394,7 @@ exports.createJob = async (req, res) => {
       jobTiming: body.jobTiming || "10:00 AM to 05:00 PM",
       workingDays: body.workingDays || "Mon - Fri",
       contactPerson: {
-        name: body.contactPerson?.name || body.recruiterName || "",
+        name: body.contactPerson?.name || body.recruiterName || "gvhj",
         designation: body.contactPerson?.designation || body.recruiterDesignation || "HR Manager"
       },
       recruiterWhatsappNumber: body.recruiterWhatsappNumber || "",
@@ -544,7 +538,7 @@ exports.suspendJob = async (req, res) => {
   }
 };
 
-// 9. TOGGLE FEATURE
+// 9. TOGGLE FEATURE STATUS
 exports.toggleFeature = async (req, res) => {
   try {
     const { id } = req.params;
@@ -559,7 +553,7 @@ exports.toggleFeature = async (req, res) => {
   }
 };
 
-// 10. TOGGLE STATUS
+// 10. TOGGLE ACTIVE STATUS
 exports.toggleStatus = async (req, res) => {
   try {
     const { id } = req.params;
@@ -575,7 +569,7 @@ exports.toggleStatus = async (req, res) => {
   }
 };
 
-// 11. TOGGLE CONTACT VISIBILITY
+// 11. TOGGLE CONTACT VISIBILITY IN BULK
 exports.updateContactVisibility = async (req, res) => {
   try {
     const { id } = req.params;
@@ -590,7 +584,7 @@ exports.updateContactVisibility = async (req, res) => {
   }
 };
 
-// 12. STATS
+// 12. DB STATISTICS
 exports.getJobStats = async (req, res) => {
   try {
     const [total, live, pending, rejected] = await Promise.all([
