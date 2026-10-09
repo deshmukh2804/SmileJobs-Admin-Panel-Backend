@@ -22,17 +22,47 @@ const jobSchema = new mongoose.Schema(
       trim: true,
       index: true
     },
-    companyLogo: {
-      type: String,
-      default: ""
-    },
     companyWebsite: {
       type: String,
       default: ""
     },
+    companyLogo: {
+      url: { type: String, default: "" },
+      publicId: { type: String, default: "" }
+    },
+    companyImages: [
+      {
+        url: { type: String, default: "" },
+        publicId: { type: String, default: "" }
+      }
+    ],
+    companyInitials: {
+      type: String,
+      default: ""
+    },
+    isCompanyVerified: {
+      type: Boolean,
+      default: false
+    },
+    industry: {
+      type: String,
+      default: ""
+    },
+    establishedYear: {
+      type: Number,
+      default: null
+    },
+    organizationSize: {
+      type: String,
+      default: ""
+    },
+    companyAddress: {
+      country: { type: String, default: "India" }
+    },
     jobCategory: {
       type: String,
-      required: [true, "Job category is required"],
+      required: false,
+      default: "General",
       trim: true,
       index: true
     },
@@ -46,6 +76,27 @@ const jobSchema = new mongoose.Schema(
       type: String,
       enum: ["On-site", "Hybrid", "Remote"],
       default: "On-site"
+    },
+    workMode: {
+      type: String,
+      enum: ["On-site", "Hybrid", "Remote"],
+      default: "On-site"
+    },
+    department: {
+      type: String,
+      default: ""
+    },
+    role: {
+      type: String,
+      default: ""
+    },
+    qualification: {
+      type: String,
+      default: ""
+    },
+    noticePeriod: {
+      type: String,
+      default: ""
     },
     location: {
       city: { type: String, default: "" },
@@ -65,6 +116,7 @@ const jobSchema = new mongoose.Schema(
     experience: {
       min: { type: Number, default: 0 },
       max: { type: Number, default: 0 },
+      text: { type: String, default: "" },
       level: {
         type: String,
         enum: ["Fresher", "Junior", "Mid-Level", "Senior", "Lead", "Executive"],
@@ -77,24 +129,44 @@ const jobSchema = new mongoose.Schema(
       currency: { type: String, default: "INR" },
       period: {
         type: String,
-        enum: ["Per Hour", "Per Month", "Per Year"],
-        default: "Per Month"
+        enum: ["hour", "day", "week", "month", "year", "Per Hour", "Per Month", "Per Year"],
+        default: "month"
       },
       isNegotiable: { type: Boolean, default: false },
       hideSalary: { type: Boolean, default: false }
     },
     description: {
       type: String,
-      required: [true, "Job description is required"]
+      required: false,
+      default: ""
+    },
+    jobDescription: {
+      type: String,
+      default: ""
     },
     responsibilities: [{ type: String }],
     requirements: [{ type: String }],
     skills: [{ type: String, index: true }],
     qualifications: [{ type: String }],
+    languages: [{ type: String }],
     benefits: [{ type: String }],
+    jobTiming: {
+      type: String,
+      default: ""
+    },
+    workingDays: {
+      type: String,
+      default: ""
+    },
     applicationDeadline: {
       type: Date,
       default: () => new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+    },
+
+    // Contact Person
+    contactPerson: {
+      name: { type: String, default: "" },
+      designation: { type: String, default: "" }
     },
     contactEmail: {
       type: String,
@@ -104,9 +176,37 @@ const jobSchema = new mongoose.Schema(
       type: String,
       default: ""
     },
+    recruiterEmail: {
+      type: String,
+      default: ""
+    },
+    recruiterMobileNumber: {
+      type: String,
+      default: ""
+    },
+    recruiterWhatsappNumber: {
+      type: String,
+      default: ""
+    },
+    applicationUrl: {
+      type: String,
+      default: ""
+    },
+    noPaymentInvolved: {
+      type: Boolean,
+      default: true
+    },
     isContactVisible: {
       type: Boolean,
       default: true
+    },
+    contactVisibility: {
+      whatsapp: { type: Boolean, default: false },
+      mobile: { type: Boolean, default: false }
+    },
+    whatsappContactEnabled: {
+      type: Boolean,
+      default: false
     },
 
     // Job Lifecycle Status
@@ -118,7 +218,7 @@ const jobSchema = new mongoose.Schema(
     },
     approvalStatus: {
       type: String,
-      enum: ["pending_review", "approved", "rejected", "suspended"],
+      enum: ["pending_review", "approved", "rejected", "suspended", "pending"],
       default: "pending_review",
       index: true
     },
@@ -132,12 +232,36 @@ const jobSchema = new mongoose.Schema(
       default: false,
       index: true
     },
+    featured: {
+      type: Boolean,
+      default: false
+    },
     isUrgent: {
       type: Boolean,
       default: false
     },
+    isNew: {
+      type: Boolean,
+      default: true
+    },
 
-    // Source tracking: admin vs recruiter
+    // Applicants
+    applicantsCount: {
+      type: Number,
+      default: 0
+    },
+    applicantsCap: {
+      type: Number,
+      default: 100
+    },
+
+    // Posted At
+    postedAt: {
+      type: Date,
+      default: Date.now
+    },
+
+    // Source tracking
     postedBy: {
       type: String,
       enum: ["admin", "recruiter"],
@@ -146,7 +270,7 @@ const jobSchema = new mongoose.Schema(
     },
     postedByUserId: {
       type: String,
-      default: null
+      default: ""
     },
     postedByName: {
       type: String,
@@ -158,7 +282,7 @@ const jobSchema = new mongoose.Schema(
     },
     postedByRole: {
       type: String,
-      default: "recruiter"
+      default: ""
     },
 
     // Audit fields
@@ -202,8 +326,46 @@ const jobSchema = new mongoose.Schema(
   }
 );
 
+// Auto-generate companyInitials
+jobSchema.pre("save", function (next) {
+  if (this.companyName && !this.companyInitials) {
+    this.companyInitials = this.companyName
+      .split(" ")
+      .map((w) => w[0])
+      .join("")
+      .toUpperCase()
+      .slice(0, 2);
+  }
+  // Sync description & jobDescription
+  if (this.jobDescription && !this.description) {
+    this.description = this.jobDescription;
+  }
+  if (this.description && !this.jobDescription) {
+    this.jobDescription = this.description;
+  }
+  // Sync workMode & workplaceType
+  if (this.workMode && !this.workplaceType) {
+    this.workplaceType = this.workMode;
+  }
+  if (this.workplaceType && !this.workMode) {
+    this.workMode = this.workplaceType;
+  }
+  // Sync featured & isFeatured
+  if (this.featured !== undefined) this.isFeatured = this.featured;
+  // Sync whatsappContactEnabled
+  if (this.contactVisibility?.whatsapp !== undefined) {
+    this.whatsappContactEnabled = this.contactVisibility.whatsapp;
+  }
+  next();
+});
+
 jobSchema.index({ status: 1, approvalStatus: 1, isActive: 1, createdAt: -1 });
 jobSchema.index({ postedBy: 1, status: 1 });
-jobSchema.index({ title: "text", companyName: "text", description: "text", skills: "text" });
+jobSchema.index({
+  title: "text",
+  companyName: "text",
+  description: "text",
+  skills: "text"
+});
 
 module.exports = mongoose.model("Job", jobSchema);
