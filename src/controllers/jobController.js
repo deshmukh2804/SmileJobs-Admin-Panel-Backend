@@ -2,8 +2,6 @@ const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 const Job = require("../models/Job");
 const Recruiter = require("../models/Recruiter");
-const Candidate = require("../models/Candidate");
-const Application = require("../models/Application");
 const { sendEmail } = require("../utils/mailer");
 
 // Helper to decode JWT inline for public endpoints
@@ -43,6 +41,7 @@ const isAnyAdmin = (req, user) => {
   return (
     role === "admin" ||
     role === "superadmin" ||
+    role === "super admin" ||
     role === "careerflow_admin" ||
     role === "subadmin" ||
     role === "manager" ||
@@ -65,6 +64,21 @@ const populateRecruiterSafe = async (query) => {
   }
 };
 
+// Normalize status alias (frontend sends "Pending", schema has "Pending Approval")
+const normalizeStatusFilter = (status) => {
+  if (!status) return null;
+  const map = {
+    "pending": ["Pending Approval", "Pending"],
+    "pending approval": ["Pending Approval", "Pending"],
+    "live": ["Live"],
+    "rejected": ["Rejected"],
+    "expired": ["Expired"],
+    "closed": ["Closed"],
+    "draft": ["Draft"]
+  };
+  return map[String(status).toLowerCase()] || [status];
+};
+
 // 1. GET ALL JOBS
 exports.getJobs = async (req, res) => {
   try {
@@ -81,7 +95,16 @@ exports.getJobs = async (req, res) => {
 
     if (isAuthorizedAdmin) {
       if (req.query.status && req.query.status !== "All") {
-        filter.status = req.query.status;
+        const statusValues = normalizeStatusFilter(req.query.status);
+        if (String(req.query.status).toLowerCase() === "pending" || String(req.query.status).toLowerCase() === "pending approval") {
+          // Match either status OR approvalStatus for pending
+          filter.$or = [
+            { status: { $in: statusValues } },
+            { approvalStatus: "pending_review" }
+          ];
+        } else {
+          filter.status = { $in: statusValues };
+        }
       }
       if (req.query.approvalStatus && req.query.approvalStatus !== "All") {
         filter.approvalStatus = req.query.approvalStatus;
@@ -95,7 +118,8 @@ exports.getJobs = async (req, res) => {
         filter.recruiterId = recruiterId;
       }
       if (req.query.status && req.query.status !== "All") {
-        filter.status = req.query.status;
+        const statusValues = normalizeStatusFilter(req.query.status);
+        filter.status = { $in: statusValues };
       }
     } else {
       // Candidate / Public user: strictly live and approved
@@ -111,15 +135,24 @@ exports.getJobs = async (req, res) => {
       filter.jobType = req.query.jobType;
     }
     if (req.query.workplaceType && req.query.workplaceType !== "All") {
-      filter.workplaceType = req.query.workplaceType;
+      filter.$or = [
+        { workplaceType: req.query.workplaceType },
+        { workMode: req.query.workplaceType }
+      ];
+    }
+    if (req.query.workMode && req.query.workMode !== "All") {
+      filter.workMode = req.query.workMode;
     }
     if (req.query.isFeatured !== undefined) {
-      filter.isFeatured = req.query.isFeatured === "true";
+      filter.$or = [
+        { isFeatured: req.query.isFeatured === "true" },
+        { featured: req.query.isFeatured === "true" }
+      ];
     }
 
     if (req.query.search && req.query.search.trim()) {
       const s = req.query.search.trim();
-      filter.$or = [
+      const searchOr = [
         { title: { $regex: s, $options: "i" } },
         { companyName: { $regex: s, $options: "i" } },
         { "location.city": { $regex: s, $options: "i" } },
@@ -127,6 +160,12 @@ exports.getJobs = async (req, res) => {
         { skills: { $in: [new RegExp(s, "i")] } },
         { postedByName: { $regex: s, $options: "i" } }
       ];
+      if (filter.$or) {
+        filter.$and = [{ $or: filter.$or }, { $or: searchOr }];
+        delete filter.$or;
+      } else {
+        filter.$or = searchOr;
+      }
     }
 
     let sort = { createdAt: -1 };
@@ -143,7 +182,12 @@ exports.getJobs = async (req, res) => {
     const [total, live, pending, rejected, expired, adminPosted, recruiterPosted] = await Promise.all([
       Job.countDocuments({}),
       Job.countDocuments({ status: "Live", approvalStatus: "approved" }),
-      Job.countDocuments({ approvalStatus: "pending_review" }),
+      Job.countDocuments({
+        $or: [
+          { status: { $in: ["Pending Approval", "Pending"] } },
+          { approvalStatus: "pending_review" }
+        ]
+      }),
       Job.countDocuments({ approvalStatus: "rejected" }),
       Job.countDocuments({ status: "Expired" }),
       Job.countDocuments({ $or: [{ postedBy: "admin" }, { recruiterId: null }] }),
@@ -153,6 +197,7 @@ exports.getJobs = async (req, res) => {
     return res.status(200).json({
       success: true,
       jobs,
+      data: jobs, // alias so frontend using `data` also works
       counts: {
         total,
         live,
@@ -194,11 +239,30 @@ exports.getJobById = async (req, res) => {
       await Job.findByIdAndUpdate(id, { $inc: { "stats.views": 1 } });
     }
 
-    return res.status(200).json({ success: true, job });
+    return res.status(200).json({ success: true, job, data: job });
   } catch (error) {
     console.error("getJobById Error:", error);
     return res.status(500).json({ success: false, message: error.message || "Failed to fetch job" });
   }
+};
+
+// Helper to parse JSON-string nested fields coming from FormData
+const parseJsonFields = (body) => {
+  const fieldsToParse = [
+    "location", "salary", "experience", "companyAddress", "companyLogo",
+    "companyImages", "contactPerson", "contactVisibility", "skills",
+    "requirements", "responsibilities", "qualifications", "benefits",
+    "languages"
+  ];
+  fieldsToParse.forEach((f) => {
+    if (typeof body[f] === "string") {
+      const str = body[f].trim();
+      if ((str.startsWith("{") && str.endsWith("}")) || (str.startsWith("[") && str.endsWith("]"))) {
+        try { body[f] = JSON.parse(str); } catch { /* leave as-is */ }
+      }
+    }
+  });
+  return body;
 };
 
 // 3. CREATE JOB
@@ -207,40 +271,59 @@ exports.createJob = async (req, res) => {
     const user = decodeUserFromRequest(req) || req.user;
     const isAuthorizedAdmin = isAnyAdmin(req, user);
 
-    const body = { ...req.body };
+    let body = { ...req.body };
+    body = parseJsonFields(body);
 
-    // Format location if flat fields passed
+    // Handle file uploads (logo & images) from multer
+    if (req.files) {
+      if (req.files.logo && req.files.logo[0]) {
+        const f = req.files.logo[0];
+        body.companyLogo = {
+          url: f.path || f.secure_url || f.location || "",
+          publicId: f.filename || f.public_id || ""
+        };
+      }
+      if (req.files.images && req.files.images.length > 0) {
+        body.companyImages = req.files.images.map((f) => ({
+          url: f.path || f.secure_url || f.location || "",
+          publicId: f.filename || f.public_id || ""
+        }));
+      }
+    }
+
+    // Format flat location fields if passed
     if (body.city || body.state || body.address || body.country) {
       body.location = {
+        address: body.address || body.location?.address || "",
         city: body.city || body.location?.city || "",
         state: body.state || body.location?.state || "",
-        country: body.country || body.location?.country || "India",
-        address: body.address || body.location?.address || ""
+        country: body.country || body.location?.country || "India"
       };
     }
 
-    // Format salary
+    // Format salary (flat fields)
     if (body.minSalary !== undefined || body.maxSalary !== undefined) {
       body.salary = {
         min: Number(body.minSalary || body.salary?.min || 0),
         max: Number(body.maxSalary || body.salary?.max || 0),
         currency: body.currency || body.salary?.currency || "INR",
-        period: body.salaryPeriod || body.salary?.period || "Per Month",
+        period: body.salaryPeriod || body.salary?.period || "month",
         isNegotiable: Boolean(body.isNegotiable || body.salary?.isNegotiable)
       };
     }
 
-    // Format experience
+    // Format experience (flat fields)
     if (body.minExp !== undefined || body.maxExp !== undefined) {
       body.experience = {
         min: Number(body.minExp || body.experience?.min || 0),
         max: Number(body.maxExp || body.experience?.max || 0),
+        text: body.experienceText || body.experience?.text || "",
         level: body.experienceLevel || body.experience?.level || "Fresher"
       };
     }
 
-    // Array fields parser
-    ["skills", "requirements", "responsibilities", "qualifications", "benefits"].forEach((field) => {
+    // Array fields parser (comma strings)
+    ["skills", "requirements", "responsibilities", "qualifications", "benefits", "languages"].forEach((field) => {
       if (typeof body[field] === "string") {
         body[field] = body[field]
           .split(",")
@@ -248,6 +331,28 @@ exports.createJob = async (req, res) => {
           .filter(Boolean);
       }
     });
+
+    // Auto-generate companyInitials if not set
+    if (!body.companyInitials && body.companyName) {
+      body.companyInitials = body.companyName
+        .split(" ")
+        .filter(Boolean)
+        .slice(0, 2)
+        .map((w) => w[0].toUpperCase())
+        .join("");
+    }
+
+    // Sync workMode <-> workplaceType
+    if (body.workMode && !body.workplaceType) body.workplaceType = body.workMode;
+    if (body.workplaceType && !body.workMode) body.workMode = body.workplaceType;
+
+    // Sync description aliases
+    if (body.jobDescription && !body.description) body.description = body.jobDescription;
+    if (body.description && !body.jobDescription) body.jobDescription = body.description;
+
+    // Sync featured flags
+    if (body.featured !== undefined && body.isFeatured === undefined) body.isFeatured = body.featured;
+    if (body.isFeatured !== undefined && body.featured === undefined) body.featured = body.isFeatured;
 
     let finalPostedBy = "recruiter";
     let finalPostedByName = "Recruiter";
@@ -261,7 +366,7 @@ exports.createJob = async (req, res) => {
 
     if (isAuthorizedAdmin) {
       finalPostedBy = "admin";
-      finalPostedByRole = "admin";
+      finalPostedByRole = user?.role || "Super Admin";
       finalPostedByName =
         user?.name ||
         user?.fullName ||
@@ -270,7 +375,8 @@ exports.createJob = async (req, res) => {
         "Admin";
       finalPostedByEmail = user?.email || body.postedByEmail || "admin@careerflow.com";
       finalStatus = body.status && body.status !== "Pending Approval" ? body.status : "Live";
-      finalApprovalStatus = finalStatus === "Live" ? "approved" : "pending_review";
+      finalApprovalStatus =
+        body.approvalStatus || (finalStatus === "Live" ? "approved" : "pending_review");
       finalIsActive = finalStatus === "Live";
       if (finalApprovalStatus === "approved") {
         approvedAt = new Date();
@@ -285,7 +391,8 @@ exports.createJob = async (req, res) => {
         body.postedByName ||
         body.companyName ||
         "Recruiter";
-      finalPostedByEmail = user?.email || body.postedByEmail || "";
+      finalPostedByEmail = user?.email || body.postedByEmail || body.recruiterEmail || "";
+      // Recruiter-posted jobs ALWAYS start as Pending Approval, regardless of client input
       finalStatus = "Pending Approval";
       finalApprovalStatus = "pending_review";
       finalIsActive = false;
@@ -297,14 +404,20 @@ exports.createJob = async (req, res) => {
       postedByName: finalPostedByName,
       postedByEmail: finalPostedByEmail,
       postedByRole: finalPostedByRole,
-      postedByUserId: user?._id || user?.id || null,
-      recruiterId: isAuthorizedAdmin ? (body.recruiterId || null) : (user?._id || user?.id || body.recruiterId || null),
+      postedByUserId: user?._id || user?.id || body.postedByUserId || null,
+      recruiterId: isAuthorizedAdmin
+        ? (body.recruiterId || user?._id || user?.id || null)
+        : (user?._id || user?.id || body.recruiterId || null),
       status: finalStatus,
       approvalStatus: finalApprovalStatus,
       isActive: finalIsActive,
       submittedForReviewAt: new Date(),
+      postedAt: new Date(),
       approvedAt,
-      approvedBy
+      approvedBy,
+      applicantsCount: body.applicantsCount ?? 0,
+      applicantsCap: body.applicantsCap ?? 100,
+      isNew: true
     };
 
     const newJob = await Job.create(jobData);
@@ -314,7 +427,8 @@ exports.createJob = async (req, res) => {
       message: isAuthorizedAdmin
         ? "Job created and published successfully by Admin"
         : "Job submitted successfully and is pending admin approval",
-      job: newJob
+      job: newJob,
+      data: newJob
     });
   } catch (error) {
     console.error("createJob Error:", error);
@@ -338,15 +452,33 @@ exports.updateJob = async (req, res) => {
     const user = decodeUserFromRequest(req) || req.user;
     const isAuthorizedAdmin = isAnyAdmin(req, user);
 
-    const updates = { ...req.body };
+    let updates = { ...req.body };
+    updates = parseJsonFields(updates);
+
+    // Handle file uploads
+    if (req.files) {
+      if (req.files.logo && req.files.logo[0]) {
+        const f = req.files.logo[0];
+        updates.companyLogo = {
+          url: f.path || f.secure_url || f.location || "",
+          publicId: f.filename || f.public_id || ""
+        };
+      }
+      if (req.files.images && req.files.images.length > 0) {
+        updates.companyImages = req.files.images.map((f) => ({
+          url: f.path || f.secure_url || f.location || "",
+          publicId: f.filename || f.public_id || ""
+        }));
+      }
+    }
 
     // Format location if flat
     if (updates.city || updates.state || updates.address) {
       updates.location = {
+        address: updates.address || existingJob.location?.address || "",
         city: updates.city || existingJob.location?.city || "",
         state: updates.state || existingJob.location?.state || "",
-        country: updates.country || existingJob.location?.country || "India",
-        address: updates.address || existingJob.location?.address || ""
+        country: updates.country || existingJob.location?.country || "India"
       };
     }
 
@@ -356,13 +488,13 @@ exports.updateJob = async (req, res) => {
         min: Number(updates.minSalary ?? existingJob.salary?.min ?? 0),
         max: Number(updates.maxSalary ?? existingJob.salary?.max ?? 0),
         currency: updates.currency || existingJob.salary?.currency || "INR",
-        period: updates.salaryPeriod || existingJob.salary?.period || "Per Month",
+        period: updates.salaryPeriod || existingJob.salary?.period || "month",
         isNegotiable: Boolean(updates.isNegotiable ?? existingJob.salary?.isNegotiable)
       };
     }
 
     // Parse array fields
-    ["skills", "requirements", "responsibilities", "qualifications", "benefits"].forEach((field) => {
+    ["skills", "requirements", "responsibilities", "qualifications", "benefits", "languages"].forEach((field) => {
       if (typeof updates[field] === "string") {
         updates[field] = updates[field]
           .split(",")
@@ -370,6 +502,14 @@ exports.updateJob = async (req, res) => {
           .filter(Boolean);
       }
     });
+
+    // Sync aliases
+    if (updates.workMode && !updates.workplaceType) updates.workplaceType = updates.workMode;
+    if (updates.workplaceType && !updates.workMode) updates.workMode = updates.workplaceType;
+    if (updates.jobDescription && !updates.description) updates.description = updates.jobDescription;
+    if (updates.description && !updates.jobDescription) updates.jobDescription = updates.description;
+    if (updates.featured !== undefined && updates.isFeatured === undefined) updates.isFeatured = updates.featured;
+    if (updates.isFeatured !== undefined && updates.featured === undefined) updates.featured = updates.isFeatured;
 
     if (!isAuthorizedAdmin && existingJob.approvalStatus === "approved") {
       updates.lastEditedAfterApproval = true;
@@ -380,7 +520,8 @@ exports.updateJob = async (req, res) => {
     return res.status(200).json({
       success: true,
       message: "Job updated successfully",
-      job: updatedJob
+      job: updatedJob,
+      data: updatedJob
     });
   } catch (error) {
     console.error("updateJob Error:", error);
@@ -413,7 +554,7 @@ exports.approveJob = async (req, res) => {
   try {
     const { id } = req.params;
     const { notes } = req.body;
-    const user = req.user || {};
+    const user = req.user || decodeUserFromRequest(req) || {};
 
     const job = await Job.findById(id);
     if (!job) {
@@ -431,8 +572,8 @@ exports.approveJob = async (req, res) => {
     await job.save();
 
     // Notify recruiter via email
-    if (job.contactEmail || job.postedByEmail) {
-      const emailTarget = job.contactEmail || job.postedByEmail;
+    const emailTarget = job.recruiterEmail || job.contactEmail || job.postedByEmail;
+    if (emailTarget) {
       sendEmail({
         to: emailTarget,
         subject: `Job Approved: "${job.title}" is now Live on CareerFlow`,
@@ -443,7 +584,8 @@ exports.approveJob = async (req, res) => {
     return res.status(200).json({
       success: true,
       message: "Job approved and published successfully",
-      job
+      job,
+      data: job
     });
   } catch (error) {
     console.error("approveJob Error:", error);
@@ -471,8 +613,8 @@ exports.rejectJob = async (req, res) => {
     await job.save();
 
     // Notify recruiter
-    if (job.contactEmail || job.postedByEmail) {
-      const emailTarget = job.contactEmail || job.postedByEmail;
+    const emailTarget = job.recruiterEmail || job.contactEmail || job.postedByEmail;
+    if (emailTarget) {
       sendEmail({
         to: emailTarget,
         subject: `Update on your job submission: "${job.title}"`,
@@ -483,7 +625,8 @@ exports.rejectJob = async (req, res) => {
     return res.status(200).json({
       success: true,
       message: "Job rejected",
-      job
+      job,
+      data: job
     });
   } catch (error) {
     console.error("rejectJob Error:", error);
@@ -512,7 +655,8 @@ exports.suspendJob = async (req, res) => {
     return res.status(200).json({
       success: true,
       message: "Job suspended successfully",
-      job
+      job,
+      data: job
     });
   } catch (error) {
     console.error("suspendJob Error:", error);
@@ -529,13 +673,16 @@ exports.toggleFeature = async (req, res) => {
       return res.status(404).json({ success: false, message: "Job not found" });
     }
 
-    job.isFeatured = !job.isFeatured;
+    const newVal = !(job.isFeatured || job.featured);
+    job.isFeatured = newVal;
+    job.featured = newVal;
     await job.save();
 
     return res.status(200).json({
       success: true,
-      message: `Job ${job.isFeatured ? "featured" : "unfeatured"} successfully`,
-      isFeatured: job.isFeatured
+      message: `Job ${newVal ? "featured" : "unfeatured"} successfully`,
+      isFeatured: newVal,
+      featured: newVal
     });
   } catch (error) {
     console.error("toggleFeature Error:", error);
@@ -579,17 +726,30 @@ exports.toggleStatus = async (req, res) => {
 exports.updateContactVisibility = async (req, res) => {
   try {
     const { id } = req.params;
+    const { whatsapp, mobile } = req.body;
+
     const job = await Job.findById(id);
     if (!job) {
       return res.status(404).json({ success: false, message: "Job not found" });
     }
 
-    job.isContactVisible = !job.isContactVisible;
+    // Support both the toggle (no body) and the explicit body modes
+    if (whatsapp !== undefined || mobile !== undefined) {
+      job.contactVisibility = {
+        whatsapp: whatsapp !== undefined ? Boolean(whatsapp) : (job.contactVisibility?.whatsapp || false),
+        mobile: mobile !== undefined ? Boolean(mobile) : (job.contactVisibility?.mobile || false)
+      };
+      job.whatsappContactEnabled = job.contactVisibility.whatsapp;
+    } else {
+      job.isContactVisible = !job.isContactVisible;
+    }
+
     await job.save();
 
     return res.status(200).json({
       success: true,
-      message: `Contact details are now ${job.isContactVisible ? "visible" : "hidden"}`,
+      message: `Contact visibility updated`,
+      contactVisibility: job.contactVisibility,
       isContactVisible: job.isContactVisible
     });
   } catch (error) {
@@ -604,7 +764,12 @@ exports.getJobStats = async (req, res) => {
     const [total, live, pending, rejected, adminCount, recruiterCount] = await Promise.all([
       Job.countDocuments({}),
       Job.countDocuments({ status: "Live", approvalStatus: "approved" }),
-      Job.countDocuments({ approvalStatus: "pending_review" }),
+      Job.countDocuments({
+        $or: [
+          { status: { $in: ["Pending Approval", "Pending"] } },
+          { approvalStatus: "pending_review" }
+        ]
+      }),
       Job.countDocuments({ approvalStatus: "rejected" }),
       Job.countDocuments({ $or: [{ postedBy: "admin" }, { recruiterId: null }] }),
       Job.countDocuments({ postedBy: "recruiter", recruiterId: { $ne: null } })
