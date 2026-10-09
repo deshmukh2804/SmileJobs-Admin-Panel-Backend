@@ -2,9 +2,9 @@ const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 const Job = require("../models/Job");
 const Recruiter = require("../models/Recruiter");
-const Candidate = require("../models/Candidate");
-const Application = require("../models/Application");
 const { sendEmail } = require("../utils/mailer");
+
+
 
 // Helper to decode JWT inline for public endpoints
 const decodeUserFromRequest = (req) => {
