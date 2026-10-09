@@ -36,13 +36,13 @@ const isAnyAdmin = (req, user) => {
   if (req?.body?.postedBy === "admin" || req?.body?.postedByRole === "admin") return true;
 
   const u = user || req?.user || req?.admin || {};
-  const role = String(u.role || u.userType || u.type || "").toLowerCase();
+  // 🚀 FIX: Strip spaces so "Super Admin" matches "superadmin" correctly!
+  const role = String(u.role || u.userType || u.type || "").toLowerCase().replace(/\s+/g, "");
 
   return (
     role === "admin" ||
     role === "superadmin" ||
-    role === "super admin" ||
-    role === "careerflow_admin" ||
+    role === "careerflowadmin" ||
     role === "subadmin" ||
     role === "manager" ||
     u.isAdmin === true ||
@@ -97,7 +97,6 @@ exports.getJobs = async (req, res) => {
       if (req.query.status && req.query.status !== "All") {
         const statusValues = normalizeStatusFilter(req.query.status);
         if (String(req.query.status).toLowerCase() === "pending" || String(req.query.status).toLowerCase() === "pending approval") {
-          // Match either status OR approvalStatus for pending
           filter.$or = [
             { status: { $in: statusValues } },
             { approvalStatus: "pending_review" }
@@ -122,7 +121,6 @@ exports.getJobs = async (req, res) => {
         filter.status = { $in: statusValues };
       }
     } else {
-      // Candidate / Public user: strictly live and approved
       filter.status = "Live";
       filter.approvalStatus = "approved";
       filter.isActive = true;
@@ -134,20 +132,11 @@ exports.getJobs = async (req, res) => {
     if (req.query.jobType && req.query.jobType !== "All") {
       filter.jobType = req.query.jobType;
     }
-    if (req.query.workplaceType && req.query.workplaceType !== "All") {
-      filter.$or = [
-        { workplaceType: req.query.workplaceType },
-        { workMode: req.query.workplaceType }
-      ];
-    }
     if (req.query.workMode && req.query.workMode !== "All") {
       filter.workMode = req.query.workMode;
     }
     if (req.query.isFeatured !== undefined) {
-      filter.$or = [
-        { isFeatured: req.query.isFeatured === "true" },
-        { featured: req.query.isFeatured === "true" }
-      ];
+      filter.featured = req.query.isFeatured === "true";
     }
 
     if (req.query.search && req.query.search.trim()) {
@@ -171,14 +160,12 @@ exports.getJobs = async (req, res) => {
     let sort = { createdAt: -1 };
     if (req.query.sortBy === "views") sort = { "stats.views": -1, createdAt: -1 };
     if (req.query.sortBy === "applications") sort = { "stats.applications": -1, createdAt: -1 };
-    if (req.query.sortBy === "salary") sort = { "salary.max": -1, createdAt: -1 };
 
     const [jobs, totalCount] = await Promise.all([
       populateRecruiterSafe(Job.find(filter).sort(sort).skip(skip).limit(limit).lean()),
       Job.countDocuments(filter)
     ]);
 
-    // Counts summary
     const [total, live, pending, rejected, expired, adminPosted, recruiterPosted] = await Promise.all([
       Job.countDocuments({}),
       Job.countDocuments({ status: "Live", approvalStatus: "approved" }),
@@ -197,7 +184,7 @@ exports.getJobs = async (req, res) => {
     return res.status(200).json({
       success: true,
       jobs,
-      data: jobs, // alias so frontend using `data` also works
+      data: jobs,
       counts: {
         total,
         live,
@@ -233,7 +220,6 @@ exports.getJobById = async (req, res) => {
       return res.status(404).json({ success: false, message: "Job not found" });
     }
 
-    // Increment views for non-admin viewers
     const user = decodeUserFromRequest(req);
     if (!isAnyAdmin(req, user)) {
       await Job.findByIdAndUpdate(id, { $inc: { "stats.views": 1 } });
@@ -246,7 +232,6 @@ exports.getJobById = async (req, res) => {
   }
 };
 
-// Helper to parse JSON-string nested fields coming from FormData
 const parseJsonFields = (body) => {
   const fieldsToParse = [
     "location", "salary", "experience", "companyAddress", "companyLogo",
@@ -274,7 +259,7 @@ exports.createJob = async (req, res) => {
     let body = { ...req.body };
     body = parseJsonFields(body);
 
-    // Handle file uploads (logo & images) from multer
+    // Handle files
     if (req.files) {
       if (req.files.logo && req.files.logo[0]) {
         const f = req.files.logo[0];
@@ -291,7 +276,7 @@ exports.createJob = async (req, res) => {
       }
     }
 
-    // Format flat location fields if passed
+    // Format fields
     if (body.city || body.state || body.address || body.country) {
       body.location = {
         address: body.address || body.location?.address || "",
@@ -301,58 +286,28 @@ exports.createJob = async (req, res) => {
       };
     }
 
-    // Format salary (flat fields)
     if (body.minSalary !== undefined || body.maxSalary !== undefined) {
       body.salary = {
         min: Number(body.minSalary || body.salary?.min || 0),
         max: Number(body.maxSalary || body.salary?.max || 0),
         currency: body.currency || body.salary?.currency || "INR",
-        period: body.salaryPeriod || body.salary?.period || "month",
-        isNegotiable: Boolean(body.isNegotiable || body.salary?.isNegotiable)
+        period: body.salaryPeriod || body.salary?.period || "month"
       };
     }
 
-    // Format experience (flat fields)
     if (body.minExp !== undefined || body.maxExp !== undefined) {
       body.experience = {
         min: Number(body.minExp || body.experience?.min || 0),
         max: Number(body.maxExp || body.experience?.max || 0),
-        text: body.experienceText || body.experience?.text || "",
-        level: body.experienceLevel || body.experience?.level || "Fresher"
+        text: body.experienceText || body.experience?.text || ""
       };
     }
 
-    // Array fields parser (comma strings)
     ["skills", "requirements", "responsibilities", "qualifications", "benefits", "languages"].forEach((field) => {
       if (typeof body[field] === "string") {
-        body[field] = body[field]
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean);
+        body[field] = body[field].split(",").map((s) => s.trim()).filter(Boolean);
       }
     });
-
-    // Auto-generate companyInitials if not set
-    if (!body.companyInitials && body.companyName) {
-      body.companyInitials = body.companyName
-        .split(" ")
-        .filter(Boolean)
-        .slice(0, 2)
-        .map((w) => w[0].toUpperCase())
-        .join("");
-    }
-
-    // Sync workMode <-> workplaceType
-    if (body.workMode && !body.workplaceType) body.workplaceType = body.workMode;
-    if (body.workplaceType && !body.workMode) body.workMode = body.workplaceType;
-
-    // Sync description aliases
-    if (body.jobDescription && !body.description) body.description = body.jobDescription;
-    if (body.description && !body.jobDescription) body.jobDescription = body.description;
-
-    // Sync featured flags
-    if (body.featured !== undefined && body.isFeatured === undefined) body.isFeatured = body.featured;
-    if (body.isFeatured !== undefined && body.featured === undefined) body.featured = body.isFeatured;
 
     let finalPostedBy = "recruiter";
     let finalPostedByName = "Recruiter";
@@ -367,66 +322,115 @@ exports.createJob = async (req, res) => {
     if (isAuthorizedAdmin) {
       finalPostedBy = "admin";
       finalPostedByRole = user?.role || "Super Admin";
-      finalPostedByName =
-        user?.name ||
-        user?.fullName ||
-        body.postedByName ||
-        user?.email?.split("@")[0] ||
-        "Admin";
-      finalPostedByEmail = user?.email || body.postedByEmail || "admin@careerflow.com";
-      finalStatus = body.status && body.status !== "Pending Approval" ? body.status : "Live";
-      finalApprovalStatus =
-        body.approvalStatus || (finalStatus === "Live" ? "approved" : "pending_review");
-      finalIsActive = finalStatus === "Live";
-      if (finalApprovalStatus === "approved") {
-        approvedAt = new Date();
-        approvedBy = finalPostedByName;
-      }
+      finalPostedByName = user?.name || user?.fullName || "Smile Jobs";
+      finalPostedByEmail = user?.email || "smilejobs@gmail.com";
+      finalStatus = "Live";
+      finalApprovalStatus = "approved";
+      finalIsActive = true;
+      approvedAt = new Date();
+      approvedBy = finalPostedByName;
     } else {
       finalPostedBy = "recruiter";
       finalPostedByRole = "recruiter";
-      finalPostedByName =
-        user?.name ||
-        user?.companyName ||
-        body.postedByName ||
-        body.companyName ||
-        "Recruiter";
-      finalPostedByEmail = user?.email || body.postedByEmail || body.recruiterEmail || "";
-      // Recruiter-posted jobs ALWAYS start as Pending Approval, regardless of client input
+      finalPostedByName = user?.name || user?.companyName || "Recruiter";
+      finalPostedByEmail = user?.email || body.recruiterEmail || "";
       finalStatus = "Pending Approval";
       finalApprovalStatus = "pending_review";
       finalIsActive = false;
     }
 
+    // 🚀 WATER-TIGHT PAYLOAD STRUCTURE: Force all target keys explicitly
     const jobData = {
-      ...body,
+      title: body.title || "",
+      recruiterId: isAuthorizedAdmin ? (body.recruiterId || user?._id || user?.id || null) : (user?._id || user?.id || null),
+      companyName: body.companyName || "",
+      companyWebsite: body.companyWebsite || "",
+      companyLogo: {
+        url: body.companyLogo?.url || "",
+        publicId: body.companyLogo?.publicId || ""
+      },
+      companyImages: body.companyImages || [],
+      companyInitials: body.companyInitials || "",
+      industry: body.industry || "",
+      establishedYear: body.establishedYear ? Number(body.establishedYear) : null,
+      organizationSize: body.organizationSize || "",
+      companyAddress: {
+        city: body.companyAddress?.city || "",
+        state: body.companyAddress?.state || "",
+        country: body.companyAddress?.country || "India"
+      },
+      location: {
+        address: body.location?.address || "",
+        city: body.location?.city || "",
+        state: body.location?.state || "",
+        country: body.location?.country || "India"
+      },
+      salary: {
+        min: Number(body.salary?.min || 0),
+        max: Number(body.salary?.max || 0),
+        currency: body.salary?.currency || "INR",
+        period: body.salary?.period || "month"
+      },
+      experience: {
+        min: Number(body.experience?.min || 0),
+        max: Number(body.experience?.max || 0),
+        text: body.experience?.text || ""
+      },
+      noticePeriod: body.noticePeriod || "",
+      jobType: body.jobType || "Full-Time",
+      workMode: body.workMode || "On-site",
+      department: body.department || "",
+      role: body.role || "",
+      qualification: body.qualification || "",
+      skills: body.skills || [],
+      languages: body.languages || [],
+      jobDescription: body.jobDescription || body.description || "",
+      responsibilities: body.responsibilities || [],
+      requirements: body.requirements || [],
+      benefits: body.benefits || [],
+      jobTiming: body.jobTiming || "",
+      workingDays: body.workingDays || "",
+      contactPerson: {
+        name: body.contactPerson?.name || "",
+        designation: body.contactPerson?.designation || ""
+      },
+      recruiterWhatsappNumber: body.recruiterWhatsappNumber || "",
+      recruiterMobileNumber: body.recruiterMobileNumber || "",
+      recruiterEmail: body.recruiterEmail || finalPostedByEmail || "",
+      applicationUrl: body.applicationUrl || "",
+      noPaymentInvolved: body.noPaymentInvolved !== undefined ? Boolean(body.noPaymentInvolved) : true,
+      contactVisibility: {
+        whatsapp: body.contactVisibility?.whatsapp !== undefined ? Boolean(body.contactVisibility.whatsapp) : false,
+        mobile: body.contactVisibility?.mobile !== undefined ? Boolean(body.contactVisibility.mobile) : false
+      },
+      whatsappContactEnabled: body.whatsappContactEnabled !== undefined ? Boolean(body.whatsappContactEnabled) : false,
+      status: finalStatus,
+      isActive: finalIsActive,
+      featured: body.featured !== undefined ? Boolean(body.featured) : false,
+      isNew: true,
+      isCompanyVerified: body.isCompanyVerified !== undefined ? Boolean(body.isCompanyVerified) : false,
       postedBy: finalPostedBy,
+      postedByUserId: String(user?._id || user?.id || ""),
       postedByName: finalPostedByName,
       postedByEmail: finalPostedByEmail,
       postedByRole: finalPostedByRole,
-      postedByUserId: user?._id || user?.id || body.postedByUserId || null,
-      recruiterId: isAuthorizedAdmin
-        ? (body.recruiterId || user?._id || user?.id || null)
-        : (user?._id || user?.id || body.recruiterId || null),
-      status: finalStatus,
       approvalStatus: finalApprovalStatus,
-      isActive: finalIsActive,
       submittedForReviewAt: new Date(),
-      postedAt: new Date(),
-      approvedAt,
-      approvedBy,
-      applicantsCount: body.applicantsCount ?? 0,
-      applicantsCap: body.applicantsCap ?? 100,
-      isNew: true
+      approvedAt: approvedAt,
+      approvedBy: approvedBy,
+      rejectionReason: "",
+      reviewNotes: "",
+      lastEditedAfterApproval: false,
+      applicantsCount: 0,
+      applicantsCap: body.applicantsCap ? Number(body.applicantsCap) : 100,
+      postedAt: new Date()
     };
 
     const newJob = await Job.create(jobData);
 
     return res.status(201).json({
       success: true,
-      message: isAuthorizedAdmin
-        ? "Job created and published successfully by Admin"
-        : "Job submitted successfully and is pending admin approval",
+      message: isAuthorizedAdmin ? "Job created successfully" : "Job submitted for review",
       job: newJob,
       data: newJob
     });
@@ -455,7 +459,6 @@ exports.updateJob = async (req, res) => {
     let updates = { ...req.body };
     updates = parseJsonFields(updates);
 
-    // Handle file uploads
     if (req.files) {
       if (req.files.logo && req.files.logo[0]) {
         const f = req.files.logo[0];
@@ -472,7 +475,6 @@ exports.updateJob = async (req, res) => {
       }
     }
 
-    // Format location if flat
     if (updates.city || updates.state || updates.address) {
       updates.location = {
         address: updates.address || existingJob.location?.address || "",
@@ -482,34 +484,20 @@ exports.updateJob = async (req, res) => {
       };
     }
 
-    // Format salary
     if (updates.minSalary !== undefined || updates.maxSalary !== undefined) {
       updates.salary = {
         min: Number(updates.minSalary ?? existingJob.salary?.min ?? 0),
         max: Number(updates.maxSalary ?? existingJob.salary?.max ?? 0),
         currency: updates.currency || existingJob.salary?.currency || "INR",
-        period: updates.salaryPeriod || existingJob.salary?.period || "month",
-        isNegotiable: Boolean(updates.isNegotiable ?? existingJob.salary?.isNegotiable)
+        period: updates.salaryPeriod || existingJob.salary?.period || "month"
       };
     }
 
-    // Parse array fields
     ["skills", "requirements", "responsibilities", "qualifications", "benefits", "languages"].forEach((field) => {
       if (typeof updates[field] === "string") {
-        updates[field] = updates[field]
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean);
+        updates[field] = updates[field].split(",").map((s) => s.trim()).filter(Boolean);
       }
     });
-
-    // Sync aliases
-    if (updates.workMode && !updates.workplaceType) updates.workplaceType = updates.workMode;
-    if (updates.workplaceType && !updates.workMode) updates.workMode = updates.workplaceType;
-    if (updates.jobDescription && !updates.description) updates.description = updates.jobDescription;
-    if (updates.description && !updates.jobDescription) updates.jobDescription = updates.description;
-    if (updates.featured !== undefined && updates.isFeatured === undefined) updates.isFeatured = updates.featured;
-    if (updates.isFeatured !== undefined && updates.featured === undefined) updates.featured = updates.isFeatured;
 
     if (!isAuthorizedAdmin && existingJob.approvalStatus === "approved") {
       updates.lastEditedAfterApproval = true;
@@ -571,7 +559,6 @@ exports.approveJob = async (req, res) => {
 
     await job.save();
 
-    // Notify recruiter via email
     const emailTarget = job.recruiterEmail || job.contactEmail || job.postedByEmail;
     if (emailTarget) {
       sendEmail({
@@ -612,7 +599,6 @@ exports.rejectJob = async (req, res) => {
 
     await job.save();
 
-    // Notify recruiter
     const emailTarget = job.recruiterEmail || job.contactEmail || job.postedByEmail;
     if (emailTarget) {
       sendEmail({
@@ -673,8 +659,7 @@ exports.toggleFeature = async (req, res) => {
       return res.status(404).json({ success: false, message: "Job not found" });
     }
 
-    const newVal = !(job.isFeatured || job.featured);
-    job.isFeatured = newVal;
+    const newVal = !(job.featured);
     job.featured = newVal;
     await job.save();
 
@@ -733,7 +718,6 @@ exports.updateContactVisibility = async (req, res) => {
       return res.status(404).json({ success: false, message: "Job not found" });
     }
 
-    // Support both the toggle (no body) and the explicit body modes
     if (whatsapp !== undefined || mobile !== undefined) {
       job.contactVisibility = {
         whatsapp: whatsapp !== undefined ? Boolean(whatsapp) : (job.contactVisibility?.whatsapp || false),
@@ -741,7 +725,7 @@ exports.updateContactVisibility = async (req, res) => {
       };
       job.whatsappContactEnabled = job.contactVisibility.whatsapp;
     } else {
-      job.isContactVisible = !job.isContactVisible;
+      job.whatsappContactEnabled = !job.whatsappContactEnabled;
     }
 
     await job.save();
@@ -750,7 +734,7 @@ exports.updateContactVisibility = async (req, res) => {
       success: true,
       message: `Contact visibility updated`,
       contactVisibility: job.contactVisibility,
-      isContactVisible: job.isContactVisible
+      whatsappContactEnabled: job.whatsappContactEnabled
     });
   } catch (error) {
     console.error("updateContactVisibility Error:", error);
