@@ -15,14 +15,19 @@ const mongoose = require("mongoose");
  */
 const getRecruiterJobIds = async (recruiterId) => {
   if (!recruiterId) return [];
-  const jobs = await Job.find({ recruiterId }).select("_id").lean();
+  let recObjectId;
+  try { recObjectId = new mongoose.Types.ObjectId(recruiterId); } catch (e) { recObjectId = null; }
+
+  const jobs = await Job.find({ 
+    recruiterId: { $in: [recruiterId, recObjectId].filter(Boolean) } 
+  }).select("_id").lean();
+  
   return jobs.map((j) => j._id);
 };
 
 /**
  * Apply dynamic scope to query filters depending on the authenticated user's role.
  * Admins retain global access; recruiters are scoped strictly to their owned jobs.
- * Supports intersection with a requested job identifier.
  */
 const applyRecruiterScope = async (filter, authUser, requestedJobId = null) => {
   if (!authUser) {
@@ -31,8 +36,10 @@ const applyRecruiterScope = async (filter, authUser, requestedJobId = null) => {
 
   // Admin access bypass
   if (authUser.role !== "recruiter") {
-    if (requestedJobId && mongoose.Types.ObjectId.isValid(requestedJobId)) {
-      filter.jobId = new mongoose.Types.ObjectId(requestedJobId);
+    if (requestedJobId) {
+      let reqJobObjectId;
+      try { reqJobObjectId = new mongoose.Types.ObjectId(requestedJobId); } catch (e) { reqJobObjectId = null; }
+      filter.jobId = { $in: [requestedJobId, reqJobObjectId].filter(Boolean) };
     }
     return true;
   }
@@ -46,15 +53,22 @@ const applyRecruiterScope = async (filter, authUser, requestedJobId = null) => {
     if (!ownedJobIdsStr.includes(requestedJobIdStr)) {
       return false; // Unauthorized access attempt detected
     }
-    filter.jobId = new mongoose.Types.ObjectId(requestedJobIdStr);
+    let reqJobObjectId;
+    try { reqJobObjectId = new mongoose.Types.ObjectId(requestedJobIdStr); } catch (e) { reqJobObjectId = null; }
+    filter.jobId = { $in: [requestedJobIdStr, reqJobObjectId].filter(Boolean) };
   } else if (filter.jobId) {
     const existingJobIdStr = filter.jobId.toString();
     if (!ownedJobIdsStr.includes(existingJobIdStr)) {
       return false; // Unauthorized access attempt detected
     }
-    filter.jobId = new mongoose.Types.ObjectId(existingJobIdStr);
+    let extJobObjectId;
+    try { extJobObjectId = new mongoose.Types.ObjectId(existingJobIdStr); } catch (e) { extJobObjectId = null; }
+    filter.jobId = { $in: [existingJobIdStr, extJobObjectId].filter(Boolean) };
   } else {
-    filter.jobId = { $in: ownedJobIds };
+    const ownedJobObjectIds = ownedJobIds.map(id => {
+      try { return new mongoose.Types.ObjectId(id); } catch { return null; }
+    }).filter(Boolean);
+    filter.jobId = { $in: [...ownedJobIdsStr, ...ownedJobObjectIds] };
   }
 
   return true;
@@ -144,7 +158,11 @@ const enrichApplications = async (applications) => {
   let recruitersMap = {};
   try {
     if (jobIds.length > 0) {
-      const jobs = await Job.find({ _id: { $in: jobIds } })
+      const jobObjectIds = jobIds.map(id => {
+        try { return new mongoose.Types.ObjectId(id); } catch { return null; }
+      }).filter(Boolean);
+
+      const jobs = await Job.find({ _id: { $in: [...jobObjectIds, ...jobIds] } })
         .select(
           "title companyName companyLogo companyWebsite recruiterId recruiterEmail recruiterMobileNumber recruiterWhatsappNumber contactPerson location workMode jobType"
         )
@@ -161,7 +179,11 @@ const enrichApplications = async (applications) => {
       ];
 
       if (recruiterIds.length > 0) {
-        const recruiters = await Recruiter.find({ _id: { $in: recruiterIds } })
+        const recObjectIds = recruiterIds.map(id => {
+          try { return new mongoose.Types.ObjectId(id); } catch { return null; }
+        }).filter(Boolean);
+
+        const recruiters = await Recruiter.find({ _id: { $in: [...recObjectIds, ...recruiterIds] } })
           .select(
             "name email mobileNumber whatsappNumber designation companyName profileImage verified"
           )
@@ -180,7 +202,11 @@ const enrichApplications = async (applications) => {
   let usersMap = {};
   try {
     if (userIds.length > 0) {
-      const users = await User.find({ _id: { $in: userIds } })
+      const uObjectIds = userIds.map(id => {
+        try { return new mongoose.Types.ObjectId(id); } catch { return null; }
+      }).filter(Boolean);
+
+      const users = await User.find({ _id: { $in: [...uObjectIds, ...userIds] } })
         .select("name email phone isActive createdAt")
         .lean();
 
@@ -210,7 +236,6 @@ const enrichApplications = async (applications) => {
     // 🔧 RESUME URL TRANSFORMATION
     // Replace raw Cloudinary URL with the mobile app backend's
     // proxy endpoint that streams a validated PDF buffer.
-    // ═══════════════════════════════════════════════════════════
     const originalResumeUrl = appObj.resumeUrl || "";
     const proxyResumeUrl = userIdStr ? buildResumeProxyUrl(userIdStr) : "";
 
@@ -328,9 +353,13 @@ const getApplications = async (req, res) => {
 
     if (status && status !== "all") filter.status = status;
     if (category && category !== "all") filter.category = category;
-    if (userId && mongoose.Types.ObjectId.isValid(userId)) {
-      filter.userId = new mongoose.Types.ObjectId(userId);
+    
+    if (userId) {
+      let userObjectId;
+      try { userObjectId = new mongoose.Types.ObjectId(userId); } catch (e) { userObjectId = null; }
+      filter.userId = { $in: [userId, userObjectId].filter(Boolean) };
     }
+    
     if (city) filter.candidateCity = { $regex: city, $options: "i" };
 
     if (matchMin || matchMax) {
@@ -350,9 +379,6 @@ const getApplications = async (req, res) => {
     // Enrich matched applications with nested entities
     const enriched = await enrichApplications(applications);
 
-    // 📈 500,000+ RECORD PERFORMANCE OPTIMIZATION
-    // Replaced 8 separate global countDocuments calls with a single scoped group aggregation.
-    // This dynamically tracks totals respecting current query, filters, and recruiter tenancy limits.
     const counts = {
       applied: 0,
       viewed: 0,
@@ -483,10 +509,6 @@ const updateApplicationStatus = async (req, res) => {
       }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // SEQUENTIAL WORKFLOW VALIDATION
-    // Prevents skipping stages (e.g. Applied -> Interview directly)
-    // ═══════════════════════════════════════════════════════════
     const currentStatus = application.status || "Applied";
 
     if (!isValidTransition(currentStatus, status)) {
@@ -582,12 +604,10 @@ const getApplicationsByJob = async (req, res) => {
     const { jobId } = req.params;
     const { page = 1, limit = 50, status } = req.query;
 
-    if (!mongoose.Types.ObjectId.isValid(jobId)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid job ID",
-      });
-    }
+    let jobObjectId;
+    try { jobObjectId = new mongoose.Types.ObjectId(jobId); } catch (e) { jobObjectId = null; }
+
+    const jobIdsArray = [jobId, jobObjectId].filter(Boolean);
 
     // 🛡️ Tenant isolation authorization check
     if (authUser.role === "recruiter") {
@@ -601,7 +621,7 @@ const getApplicationsByJob = async (req, res) => {
       }
     }
 
-    const filter = { jobId: new mongoose.Types.ObjectId(jobId) };
+    const filter = { jobId: { $in: jobIdsArray } };
     if (status && status !== "all") filter.status = status;
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -643,14 +663,11 @@ const getApplicationsByUser = async (req, res) => {
     const { userId } = req.params;
     const { page = 1, limit = 50, status } = req.query;
 
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid user ID",
-      });
-    }
+    let userObjectId;
+    try { userObjectId = new mongoose.Types.ObjectId(userId); } catch (e) { userObjectId = null; }
 
-    const filter = { userId: new mongoose.Types.ObjectId(userId) };
+    const userIdsArray = [userId, userObjectId].filter(Boolean);
+    const filter = { userId: { $in: userIdsArray } };
 
     // 🛡️ Filter scope verification for candidates viewed by recruiters
     const isAuthorized = await applyRecruiterScope(filter, authUser);

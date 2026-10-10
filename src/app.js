@@ -1,4 +1,3 @@
-// FILE: backend/src/app.js
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
@@ -22,6 +21,7 @@ const notificationRoutes = require("./routes/notificationRoutes");
 const promoEmailRoutes = require("./routes/promoEmailRoutes");
 const userManagementRoutes = require("./routes/userManagementRoutes");
 const applicationRoutes = require("./routes/applicationRoutes");
+const applicationHierarchyRoutes = require("./routes/applicationHierarchyRoutes");
 const dashboardRoutes = require("./routes/dashboardRoutes");
 
 const { seedDefaultRoles } = require("./controllers/roleController");
@@ -125,6 +125,7 @@ app.get("/health", (req, res) => {
 
 // ═══════════════════════════════════════════════════════════════
 // API V1 ROUTES
+// ⚠️ CRITICAL ORDER: Mount hierarchy BEFORE general applications!
 // ═══════════════════════════════════════════════════════════════
 app.use("/api/v1/auth", authRoutes);
 app.use("/api/v1/recruiter/auth", recruiterAuthRoutes);
@@ -140,8 +141,11 @@ app.use("/api/v1/verifications", verificationRoutes);
 app.use("/api/v1/notifications", notificationRoutes);
 app.use("/api/v1/promotional-emails", promoEmailRoutes);
 app.use("/api/v1/user-management", userManagementRoutes);
+
+// Hierarchy endpoint mounts first to bypass general /:id routes
+app.use("/api/v1/applications/hierarchy", applicationHierarchyRoutes);
 app.use("/api/v1/applications", applicationRoutes);
-app.use("/api/v1/applications/hierarchy", require("./routes/applicationHierarchyRoutes"));
+
 app.use("/api/v1/dashboard", dashboardRoutes);
 app.use("/api/v1/payments-and-billing", require("./routes/billingRoutes"));
 
