@@ -1,34 +1,8 @@
 // FILE: backend/src/controllers/applicationHierarchyController.js
 const mongoose = require("mongoose");
-const { recruiterDbConnection } = require("../config/db");
-
-// Safe lazy initialization of models to avoid OverwriteModelError
-const Recruiter = recruiterDbConnection.models.Recruiter 
-  || recruiterDbConnection.model("Recruiter", new mongoose.Schema({}, { strict: false, collection: "recruiters" }));
-
-const JobDb = mongoose.connection.useDb("Job_db", { useCache: true });
-const Job = JobDb.models.Job 
-  || JobDb.model("Job", new mongoose.Schema({}, { strict: false, collection: "jobs" }));
-
-let _ApplicationModel = null;
-const getApplicationModel = () => {
-  if (_ApplicationModel) return _ApplicationModel;
-  
-  const uri = process.env.MONGO_URI_APPLICATION 
-    || process.env.MONGO_URI_JOBS 
-    || process.env.MONGO_URI 
-    || process.env.MONGODB_URI 
-    || "mongodb://localhost:27017/application_db";
-    
-  let conn = mongoose.connections.find(c => c.name === "application_db");
-  if (!conn) {
-    conn = mongoose.createConnection(uri, { dbName: "application_db" });
-  }
-  
-  _ApplicationModel = conn.models.Application 
-    || conn.model("Application", new mongoose.Schema({}, { strict: false, collection: "applications" }));
-  return _ApplicationModel;
-};
+const Recruiter = require("../models/Recruiter");
+const Job = require("../models/Job");
+const Application = require("../models/Application");
 
 // State Machine logic for legal workflow transitions
 const WORKFLOW_TRANSITIONS = {
@@ -68,9 +42,6 @@ const getCategoryForStatus = (status) => {
 exports.getCompaniesWithStats = async (req, res) => {
   try {
     const recruiters = await Recruiter.find({}).lean();
-    const JobModel = Job;
-    const ApplicationModel = getApplicationModel();
-
     const companyMap = new Map();
 
     for (const r of recruiters) {
@@ -79,7 +50,7 @@ exports.getCompaniesWithStats = async (req, res) => {
       
       if (!companyMap.has(companyId)) {
         companyMap.set(companyId, {
-          companyId,
+          companyId: companyId.toString(),
           companyName,
           companyInitials: companyName.slice(0, 2).toUpperCase(),
           companyLogo: r.companyProfile?.logo?.url || r.avatar?.url || null,
@@ -104,7 +75,7 @@ exports.getCompaniesWithStats = async (req, res) => {
       }
     }
 
-    const allJobs = await JobModel.find({}).lean();
+    const allJobs = await Job.find({}).lean();
     for (const j of allJobs) {
       const recId = j.recruiterId ? j.recruiterId.toString() : null;
       let targetCompany = null;
@@ -122,11 +93,16 @@ exports.getCompaniesWithStats = async (req, res) => {
         targetCompany.jobCount += 1;
         
         const jobIdStr = j._id.toString();
-        const appCount = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] } });
-        const pending = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: { $in: ["Applied", "Viewed"] } });
-        const short = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: { $in: ["Shortlisted", "Interview", "Offered"] } });
-        const hired = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: "Hired" });
-        const rej = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: { $in: ["Rejected", "Withdrawn"] } });
+        let jobObjectId;
+        try { jobObjectId = new mongoose.Types.ObjectId(jobIdStr); } catch (e) { jobObjectId = null; }
+
+        const jobIdsArray = [j._id, jobIdStr, jobObjectId].filter(Boolean);
+
+        const appCount = await Application.countDocuments({ jobId: { $in: jobIdsArray } });
+        const pending = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: { $in: ["Applied", "Viewed"] } });
+        const short = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: { $in: ["Shortlisted", "Interview", "Offered"] } });
+        const hired = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: "Hired" });
+        const rej = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: { $in: ["Rejected", "Withdrawn"] } });
 
         targetCompany.applicationCount += appCount;
         targetCompany.pendingCount += pending;
@@ -150,29 +126,43 @@ exports.getCompaniesWithStats = async (req, res) => {
 exports.getJobsByCompany = async (req, res) => {
   try {
     const { companyId } = req.params;
-    const recruiters = await Recruiter.find({ 
-      $or: [{ companyId }, { _id: companyId }] 
-    }).lean();
+    
+    const queryConditions = [];
+    if (mongoose.Types.ObjectId.isValid(companyId)) {
+      const objId = new mongoose.Types.ObjectId(companyId);
+      queryConditions.push({ companyId: objId });
+      queryConditions.push({ _id: objId });
+    }
+    queryConditions.push({ companyId: String(companyId) });
+    queryConditions.push({ _id: String(companyId) });
+
+    const recruiters = await Recruiter.find({ $or: queryConditions }).lean();
 
     if (!recruiters || recruiters.length === 0) {
       return res.status(200).json({ success: true, data: [] });
     }
 
     const recruiterIds = recruiters.map(r => r._id.toString());
+    const recruiterObjectIds = recruiterIds.map(id => {
+      try { return new mongoose.Types.ObjectId(id); } catch { return null; }
+    }).filter(Boolean);
+
     const jobs = await Job.find({ 
-      recruiterId: { $in: recruiterIds.map(id => {
-        try { return new mongoose.Types.ObjectId(id); } catch { return id; }
-      }).concat(recruiterIds) }
+      recruiterId: { $in: [...recruiterObjectIds, ...recruiterIds] }
     }).lean();
 
-    const ApplicationModel = getApplicationModel();
     const enriched = [];
 
     for (const j of jobs) {
       const jobIdStr = j._id.toString();
-      const total = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] } });
-      const pending = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: { $in: ["Applied", "Viewed"] } });
-      const hired = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: "Hired" });
+      let jobObjectId;
+      try { jobObjectId = new mongoose.Types.ObjectId(jobIdStr); } catch (e) { jobObjectId = null; }
+
+      const jobIdsArray = [j._id, jobIdStr, jobObjectId].filter(Boolean);
+
+      const total = await Application.countDocuments({ jobId: { $in: jobIdsArray } });
+      const pending = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: { $in: ["Applied", "Viewed"] } });
+      const hired = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: "Hired" });
 
       enriched.push({
         ...j,
@@ -195,10 +185,14 @@ exports.getJobsByCompany = async (req, res) => {
 exports.getJobApplicationsForAdmin = async (req, res) => {
   try {
     const { jobId } = req.params;
-    const ApplicationModel = getApplicationModel();
     
-    const apps = await ApplicationModel.find({ 
-      jobId: { $in: [jobId, { toString: () => jobId }] } 
+    let jobObjectId;
+    try { jobObjectId = new mongoose.Types.ObjectId(jobId); } catch (e) { jobObjectId = null; }
+
+    const jobIdsArray = [jobId, jobObjectId].filter(Boolean);
+
+    const apps = await Application.find({ 
+      jobId: { $in: jobIdsArray } 
     }).lean();
 
     const formatted = apps.map(app => ({
@@ -219,20 +213,25 @@ exports.getJobApplicationsForAdmin = async (req, res) => {
 exports.getRecruiterJobsForAdmin = async (req, res) => {
   try {
     const { recruiterId } = req.params;
-    const queryId = recruiterId;
+    let recObjectId;
+    try { recObjectId = new mongoose.Types.ObjectId(recruiterId); } catch (e) { recObjectId = null; }
 
     const jobs = await Job.find({
-      recruiterId: { $in: [queryId, { toString: () => queryId }] }
+      recruiterId: { $in: [recruiterId, recObjectId].filter(Boolean) }
     }).lean();
 
-    const ApplicationModel = getApplicationModel();
     const enriched = [];
 
     for (const j of jobs) {
       const jobIdStr = j._id.toString();
-      const total = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] } });
-      const pending = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: { $in: ["Applied", "Viewed"] } });
-      const hired = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: "Hired" });
+      let jobObjectId;
+      try { jobObjectId = new mongoose.Types.ObjectId(jobIdStr); } catch (e) { jobObjectId = null; }
+
+      const jobIdsArray = [j._id, jobIdStr, jobObjectId].filter(Boolean);
+
+      const total = await Application.countDocuments({ jobId: { $in: jobIdsArray } });
+      const pending = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: { $in: ["Applied", "Viewed"] } });
+      const hired = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: "Hired" });
 
       enriched.push({
         ...j,
@@ -250,14 +249,10 @@ exports.getRecruiterJobsForAdmin = async (req, res) => {
 };
 
 /**
- * Admin: Get ALL jobs posted directly by Admin panel with aggressive fallback detection
+ * Admin: Get ALL jobs posted directly by Admin panel with fallback detection
  */
 exports.getAdminPostedJobs = async (req, res) => {
   try {
-    const JobModel = Job;
-    const ApplicationModel = getApplicationModel();
-
-    // Aggressive multi-field check to scan for jobs lacking active recruiter associations or explicitly flagged as Admin
     const query = {
       $or: [
         { postedBy: { $regex: /^admin$/i } },
@@ -271,17 +266,22 @@ exports.getAdminPostedJobs = async (req, res) => {
       ]
     };
 
-    const totalCount = await JobModel.countDocuments({});
-    const jobs = await JobModel.find(query).lean();
+    const totalCount = await Job.countDocuments({});
+    const jobs = await Job.find(query).lean();
 
     console.log(`[AdminJobs API] Searched Database. Total jobs in DB: ${totalCount}. Matched Admin criteria: ${jobs.length}`);
 
     const enriched = [];
     for (const j of jobs) {
       const jobIdStr = j._id.toString();
-      const total = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] } });
-      const pending = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: { $in: ["Applied", "Viewed"] } });
-      const hired = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: "Hired" });
+      let jobObjectId;
+      try { jobObjectId = new mongoose.Types.ObjectId(jobIdStr); } catch (e) { jobObjectId = null; }
+
+      const jobIdsArray = [j._id, jobIdStr, jobObjectId].filter(Boolean);
+
+      const total = await Application.countDocuments({ jobId: { $in: jobIdsArray } });
+      const pending = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: { $in: ["Applied", "Viewed"] } });
+      const hired = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: "Hired" });
 
       enriched.push({
         ...j,
@@ -306,8 +306,7 @@ exports.updateApplicationStatusByAdmin = async (req, res) => {
     const { applicationId } = req.params;
     const { status, hrNotes } = req.body;
 
-    const ApplicationModel = getApplicationModel();
-    const app = await ApplicationModel.findById(applicationId);
+    const app = await Application.findById(applicationId);
 
     if (!app) {
       return res.status(404).json({ success: false, message: "Application record not found" });
@@ -324,7 +323,7 @@ exports.updateApplicationStatusByAdmin = async (req, res) => {
 
     const category = getCategoryForStatus(status);
 
-    const updated = await ApplicationModel.findByIdAndUpdate(
+    const updated = await Application.findByIdAndUpdate(
       applicationId,
       {
         $set: {
@@ -363,16 +362,25 @@ exports.updateApplicationStatusByAdmin = async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 exports.getRecruiterJobsWithStats = async (req, res) => {
   try {
-    const recruiterId = req.user.id;
-    const jobs = await Job.find({ recruiterId }).lean();
-    const ApplicationModel = getApplicationModel();
+    const recruiterId = req.authUser?.id || req.user?.id;
+    let recObjectId;
+    try { recObjectId = new mongoose.Types.ObjectId(recruiterId); } catch (e) { recObjectId = null; }
+
+    const jobs = await Job.find({ 
+      recruiterId: { $in: [recruiterId, recObjectId].filter(Boolean) } 
+    }).lean();
 
     const data = [];
     for (const j of jobs) {
       const jobIdStr = j._id.toString();
-      const total = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] } });
-      const pending = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: { $in: ["Applied", "Viewed"] } });
-      const hired = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: "Hired" });
+      let jobObjectId;
+      try { jobObjectId = new mongoose.Types.ObjectId(jobIdStr); } catch (e) { jobObjectId = null; }
+
+      const jobIdsArray = [j._id, jobIdStr, jobObjectId].filter(Boolean);
+
+      const total = await Application.countDocuments({ jobId: { $in: jobIdsArray } });
+      const pending = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: { $in: ["Applied", "Viewed"] } });
+      const hired = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: "Hired" });
 
       data.push({
         ...j,
@@ -391,8 +399,14 @@ exports.getRecruiterJobsWithStats = async (req, res) => {
 exports.getRecruiterJobApplications = async (req, res) => {
   try {
     const { jobId } = req.params;
-    const ApplicationModel = getApplicationModel();
-    const apps = await ApplicationModel.find({ jobId }).lean();
+    let jobObjectId;
+    try { jobObjectId = new mongoose.Types.ObjectId(jobId); } catch (e) { jobObjectId = null; }
+
+    const jobIdsArray = [jobId, jobObjectId].filter(Boolean);
+
+    const apps = await Application.find({ 
+      jobId: { $in: jobIdsArray } 
+    }).lean();
 
     const formatted = apps.map(app => ({
       ...app,
