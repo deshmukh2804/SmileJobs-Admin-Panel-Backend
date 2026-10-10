@@ -141,6 +141,7 @@ app.use("/api/v1/notifications", notificationRoutes);
 app.use("/api/v1/promotional-emails", promoEmailRoutes);
 app.use("/api/v1/user-management", userManagementRoutes);
 app.use("/api/v1/applications", applicationRoutes);
+app.use("/api/v1/applications/hierarchy", require("./routes/applicationHierarchyRoutes"));
 app.use("/api/v1/dashboard", dashboardRoutes);
 app.use("/api/v1/payments-and-billing", require("./routes/billingRoutes"));
 
