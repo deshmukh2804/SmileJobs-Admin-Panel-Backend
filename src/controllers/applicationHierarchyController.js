@@ -250,16 +250,21 @@ exports.getRecruiterJobsForAdmin = async (req, res) => {
 
 /**
  * Admin: Get ALL jobs posted directly by Admin panel with fallback detection
+ * Enhanced to detect multiple possible admin-post identifiers in the database.
  */
 exports.getAdminPostedJobs = async (req, res) => {
   try {
+    // Enhanced detection: try multiple fields where an admin post marker could live
     const query = {
       $or: [
         { postedBy: { $regex: /^admin$/i } },
         { createdBy: { $regex: /^admin$/i } },
         { source: { $regex: /^admin$/i } },
+        { postedByType: { $regex: /^admin$/i } },
+        { creatorType: { $regex: /^admin$/i } },
         { isAdminPost: true },
         { isAdmin: true },
+        { adminPosted: true },
         { recruiterId: null },
         { recruiterId: "" },
         { recruiterId: { $exists: false } }
@@ -267,9 +272,9 @@ exports.getAdminPostedJobs = async (req, res) => {
     };
 
     const totalCount = await Job.countDocuments({});
-    const jobs = await Job.find(query).lean();
+    const jobs = await Job.find(query).sort({ createdAt: -1 }).lean();
 
-    console.log(`[AdminJobs API] Searched Database. Total jobs in DB: ${totalCount}. Matched Admin criteria: ${jobs.length}`);
+    console.log(`[AdminJobs API] Scanned DB. Total jobs: ${totalCount}. Admin-matched: ${jobs.length}`);
 
     const enriched = [];
     for (const j of jobs) {
@@ -283,11 +288,27 @@ exports.getAdminPostedJobs = async (req, res) => {
       const pending = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: { $in: ["Applied", "Viewed"] } });
       const hired = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: "Hired" });
 
+      // Provide a normalized shape so the frontend doesn't crash on missing fields
       enriched.push({
-        ...j,
+        _id: j._id,
+        id: jobIdStr,
+        title: j.title || "Untitled Job",
+        companyName: j.companyName || j.company || "Admin Platform",
+        companyLogo: j.companyLogo?.url || j.companyLogo || null,
+        status: j.status || "Live",
+        approvalStatus: j.approvalStatus || "approved",
+        jobType: j.jobType || "Full-Time",
+        workMode: j.workMode || "On-site",
+        postedAt: j.postedAt || j.createdAt,
+        createdByAdmin: true,
+        recruiterId: j.recruiterId || null,
+        location: j.location || "",
+        salary: j.salary || "",
         applicationCount: total,
         pendingCount: pending,
-        hiredCount: hired
+        hiredCount: hired,
+        // preserve full original fields for later use
+        _raw: j
       });
     }
 
