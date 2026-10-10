@@ -1,43 +1,36 @@
+// FILE: backend/src/controllers/applicationHierarchyController.js
 const mongoose = require("mongoose");
 const { recruiterDbConnection } = require("../config/db");
 
-// ═══════════════════════════════════════════════════════════
-// MODEL CONNECTIONS (safe re-use to avoid OverwriteModelError)
-// ═══════════════════════════════════════════════════════════
-const Recruiter = recruiterDbConnection.models.Recruiter
+// Safe lazy initialization of models to avoid OverwriteModelError
+const Recruiter = recruiterDbConnection.models.Recruiter 
   || recruiterDbConnection.model("Recruiter", new mongoose.Schema({}, { strict: false, collection: "recruiters" }));
 
 const JobDb = mongoose.connection.useDb("Job_db", { useCache: true });
-const Job = JobDb.models.Job
+const Job = JobDb.models.Job 
   || JobDb.model("Job", new mongoose.Schema({}, { strict: false, collection: "jobs" }));
 
-// Lazy-cached Application model
 let _ApplicationModel = null;
 const getApplicationModel = () => {
   if (_ApplicationModel) return _ApplicationModel;
-
-  const uri =
-    process.env.MONGO_URI_APPLICATION ||
-    process.env.MONGO_URI_JOBS ||
-    process.env.MONGO_URI ||
-    process.env.MONGODB_URI ||
-    "mongodb://localhost:27017/application_db";
-
-  let conn = mongoose.connections.find((c) => c.name === "application_db");
+  
+  const uri = process.env.MONGO_URI_APPLICATION 
+    || process.env.MONGO_URI_JOBS 
+    || process.env.MONGO_URI 
+    || process.env.MONGODB_URI 
+    || "mongodb://localhost:27017/application_db";
+    
+  let conn = mongoose.connections.find(c => c.name === "application_db");
   if (!conn) {
     conn = mongoose.createConnection(uri, { dbName: "application_db" });
   }
-
-  _ApplicationModel =
-    conn.models.Application ||
-    conn.model("Application", new mongoose.Schema({}, { strict: false, collection: "applications" }));
-
+  
+  _ApplicationModel = conn.models.Application 
+    || conn.model("Application", new mongoose.Schema({}, { strict: false, collection: "applications" }));
   return _ApplicationModel;
 };
 
-// ═══════════════════════════════════════════════════════════
-// WORKFLOW STATE MACHINE
-// ═══════════════════════════════════════════════════════════
+// State Machine logic for legal workflow transitions
 const WORKFLOW_TRANSITIONS = {
   Applied: ["Viewed", "Shortlisted", "Rejected"],
   Viewed: ["Shortlisted", "Rejected"],
@@ -46,583 +39,351 @@ const WORKFLOW_TRANSITIONS = {
   Offered: ["Hired", "Rejected"],
   Hired: [],
   Rejected: [],
-  Withdrawn: [],
+  Withdrawn: []
 };
 
-// Helper to build stats shape consistently
-const buildStats = (apps = []) => {
-  const stats = {
-    total: apps.length,
-    pending: 0,
-    viewed: 0,
-    shortlisted: 0,
-    interview: 0,
-    offered: 0,
-    hired: 0,
-    rejected: 0,
-    withdrawn: 0,
+const getWorkflowMeta = (status) => {
+  const currentStatus = status || "Applied";
+  const allowed = WORKFLOW_TRANSITIONS[currentStatus] || [];
+  return {
+    currentStatus,
+    allowedNextStatuses: allowed,
+    isTerminal: allowed.length === 0
   };
-  apps.forEach((app) => {
-    const s = (app.status || "Applied").toLowerCase();
-    if (s === "applied" || s === "pending") stats.pending++;
-    else if (s === "viewed") stats.viewed++;
-    else if (s === "shortlisted") stats.shortlisted++;
-    else if (s === "interview") stats.interview++;
-    else if (s === "offered") stats.offered++;
-    else if (s === "hired") stats.hired++;
-    else if (s === "rejected") stats.rejected++;
-    else if (s === "withdrawn") stats.withdrawn++;
-  });
-  return stats;
 };
 
-// ═══════════════════════════════════════════════════════════
-// COMPANIES (RECRUITERS AS COMPANIES)
-// ═══════════════════════════════════════════════════════════
+// Sync category based on status updates (legacy backward compatibility)
+const getCategoryForStatus = (status) => {
+  const pending = ["Applied", "Viewed"];
+  const shortlisted = ["Shortlisted", "Interview", "Offered"];
+  if (pending.includes(status)) return "pending";
+  if (shortlisted.includes(status)) return "shortlisted";
+  if (status === "Hired") return "hired";
+  return "rejected"; // Rejected, Withdrawn
+};
+
+/**
+ * Admin: Get all companies with recruiter & job counters
+ */
 exports.getCompaniesWithStats = async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
-    const search = req.query.search || "";
+    const recruiters = await Recruiter.find({}).lean();
+    const JobModel = Job;
+    const ApplicationModel = getApplicationModel();
 
-    const query = {};
-    if (search) {
-      query.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { companyName: { $regex: search, $options: "i" } },
-        { "companyProfile.name": { $regex: search, $options: "i" } },
-      ];
-    }
+    const companyMap = new Map();
 
-    const totalRecruiters = await Recruiter.countDocuments(query);
-    const recruiters = await Recruiter.find(query)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .lean();
-
-    const Application = getApplicationModel();
-
-    const enriched = await Promise.all(
-      recruiters.map(async (r) => {
-        const companyId = r._id.toString();
-        const companyName = r.companyProfile?.name || r.companyName;
-
-        const jobQuery = {
-          $or: [
-            { recruiterId: companyId },
-            { userId: companyId },
-            { createdBy: companyId },
-            { postedBy: companyId },
-          ],
-        };
-        if (companyName) {
-          jobQuery.$or.push({ companyName: companyName });
-          jobQuery.$or.push({ company: companyName });
-        }
-
-        const recruiterJobs = await Job.find(jobQuery).select("_id status").lean();
-        const jobIds = recruiterJobs.map((j) => j._id.toString());
-
-        let appStats = buildStats([]);
-        if (jobIds.length > 0) {
-          const apps = await Application.find({ jobId: { $in: jobIds } }).select("status").lean();
-          appStats = buildStats(apps);
-        }
-
-        const activeJobs = recruiterJobs.filter((j) => j.status === "Live").length;
-
-        return {
-          _id: r._id,
-          id: r._id,
-          companyId: r._id,
-          recruiterId: r._id,
-          companyName: companyName || "Unnamed Company",
-          name: companyName || r.name,
-          companyInitials:
-            r.companyProfile?.companyInitials ||
-            (companyName || r.name || "C").slice(0, 2).toUpperCase(),
-          companyLogo:
-            r.companyProfile?.logo?.url ||
-            r.companyProfile?.logo ||
-            r.avatar?.url ||
-            r.profileImage?.url ||
-            null,
-          logo: r.companyProfile?.logo || null,
-          industry: r.companyProfile?.industry || r.industry || "Not Specified",
-          city: r.companyProfile?.city || r.city || "Remote",
+    for (const r of recruiters) {
+      const companyId = r.companyId || r._id.toString();
+      const companyName = r.companyProfile?.name || r.companyName || "Independent Poster";
+      
+      if (!companyMap.has(companyId)) {
+        companyMap.set(companyId, {
+          companyId,
+          companyName,
+          companyInitials: companyName.slice(0, 2).toUpperCase(),
+          companyLogo: r.companyProfile?.logo?.url || r.avatar?.url || null,
+          industry: r.companyProfile?.industry || "Not Specified",
+          city: r.companyProfile?.city || "Not Specified",
           state: r.companyProfile?.state || "",
-          country: r.companyProfile?.country || "India",
-          address: {
-            city: r.companyProfile?.city || "",
-            state: r.companyProfile?.state || "",
-            country: r.companyProfile?.country || "",
-          },
-          verified: r.verified || r.isVerified || false,
+          country: r.companyProfile?.country || "",
+          verified: !!(r.isVerified || r.verified),
           isActive: r.isActive !== false,
-          recruiterCount: 1,
-          jobCount: recruiterJobs.length,
-          totalJobs: recruiterJobs.length,
-          activeJobs,
-          applicationCount: appStats.total,
-          pendingCount: appStats.pending,
-          shortlistedCount: appStats.shortlisted,
-          hiredCount: appStats.hired,
-          rejectedCount: appStats.rejected,
-          applicationStats: appStats,
+          recruiterId: r._id.toString(),
           recruiterName: r.name,
           recruiterEmail: r.email,
           profileImageUrl: r.profileImage?.url || r.avatar?.url || null,
-          createdAt: r.createdAt,
-        };
-      })
-    );
-
-    return res.status(200).json({
-      success: true,
-      data: enriched,
-      pagination: {
-        page,
-        limit,
-        pages: Math.ceil(totalRecruiters / limit),
-        total: totalRecruiters,
-        totalPages: Math.ceil(totalRecruiters / limit),
-        totalResults: totalRecruiters,
-        hasNextPage: page * limit < totalRecruiters,
-        hasPrevPage: page > 1,
-      },
-    });
-  } catch (err) {
-    console.error("[getCompaniesWithStats]", err);
-    return res.status(500).json({ success: false, message: err.message });
-  }
-};
-
-// ═══════════════════════════════════════════════════════════
-// JOBS BY COMPANY
-// ═══════════════════════════════════════════════════════════
-exports.getJobsByCompany = async (req, res) => {
-  try {
-    const { companyId } = req.params;
-    if (!companyId || companyId === "undefined" || companyId === "null") {
-      return res.status(400).json({ success: false, message: "Invalid Company ID parameter" });
-    }
-
-    const recruiter = await Recruiter.findById(companyId).lean();
-    const companyName = recruiter?.companyProfile?.name || recruiter?.companyName;
-
-    const query = {
-      $or: [
-        { recruiterId: companyId },
-        { userId: companyId },
-        { createdBy: companyId },
-        { postedBy: companyId },
-      ],
-    };
-    if (companyName) {
-      query.$or.push({ companyName: companyName });
-      query.$or.push({ company: companyName });
-    }
-
-    const jobs = await Job.find(query).sort({ createdAt: -1 }).lean();
-    const Application = getApplicationModel();
-
-    const enrichedJobs = await Promise.all(
-      jobs.map(async (j) => {
-        const jobIdStr = j._id.toString();
-        const apps = await Application.find({ jobId: jobIdStr }).select("status").lean();
-        const stats = buildStats(apps);
-
-        let locationStr = "Remote";
-        let locationObj = {};
-        if (j.location) {
-          if (typeof j.location === "object") {
-            locationObj = j.location;
-            locationStr =
-              [j.location.city, j.location.state].filter(Boolean).join(", ") || "Remote";
-          } else {
-            locationStr = j.location;
-          }
-        }
-
-        let salaryRange = "Not Disclosed";
-        if (j.salary && (j.salary.min || j.salary.max)) {
-          const period = j.salary.period || "month";
-          salaryRange = `₹${j.salary.min || 0} - ₹${j.salary.max || 0} / ${period}`;
-        }
-
-        return {
-          _id: j._id,
-          id: j._id,
-          jobId: j._id,
-          title: j.title || "Untitled Job",
-          companyName: j.companyName || companyName || "Unnamed Company",
-          companyLogo: j.companyLogo?.url || j.companyLogo || null,
-          location: locationStr,
-          locationObj,
-          salary: j.salary || {},
-          salaryRange,
-          experience: j.experience?.text || `${j.experience?.min || 0}-${j.experience?.max || 0} Yrs`,
-          jobType: j.jobType || "Full-Time",
-          workMode: j.workMode || "On-site",
-          status: j.status || "Live",
-          approvalStatus: j.approvalStatus || "approved",
-          isActive: j.isActive !== false,
-          featured: j.featured || false,
-          recruiterId: j.recruiterId || companyId,
-          recruiterName: recruiter?.name || j.postedBy || "Recruiter",
-          postedAt: j.postedAt || j.createdAt,
-          createdAt: j.createdAt,
-          applicantsCount: j.applicantsCount || stats.total,
-          applicationCount: stats.total,
-          pendingCount: stats.pending,
-          shortlistedCount: stats.shortlisted,
-          interviewCount: stats.interview,
-          hiredCount: stats.hired,
-          rejectedCount: stats.rejected,
-          applicationStats: stats,
-        };
-      })
-    );
-
-    return res.status(200).json({ success: true, data: enrichedJobs });
-  } catch (err) {
-    console.error("[getJobsByCompany]", err);
-    return res.status(500).json({ success: false, message: err.message });
-  }
-};
-
-// ═══════════════════════════════════════════════════════════
-// APPLICATIONS FOR A JOB (ADMIN)
-// ═══════════════════════════════════════════════════════════
-exports.getJobApplicationsForAdmin = async (req, res) => {
-  try {
-    const { jobId } = req.params;
-    if (!jobId || jobId === "undefined" || jobId === "null") {
-      return res.status(400).json({ success: false, message: "Invalid Job ID parameter" });
-    }
-
-    const job = await Job.findById(jobId).lean();
-    if (!job) {
-      return res.status(404).json({ success: false, message: "Job post not found" });
-    }
-
-    const Application = getApplicationModel();
-    const applications = await Application.find({ jobId }).sort({ appliedAt: -1 }).lean();
-
-    let recruiter = null;
-    if (job.recruiterId) {
-      try {
-        recruiter = await Recruiter.findById(job.recruiterId)
-          .select("name email mobileNumber whatsappNumber designation companyProfile profileImage avatar verified isVerified")
-          .lean();
-      } catch (e) {
-        // ignore invalid ObjectId
+          jobCount: 0,
+          applicationCount: 0,
+          pendingCount: 0,
+          shortlistedCount: 0,
+          hiredCount: 0,
+          rejectedCount: 0,
+          createdAt: r.createdAt
+        });
       }
     }
 
-    const enriched = applications.map((app) => {
-      const currentStatus = app.status || "Applied";
-      const allowedNext = WORKFLOW_TRANSITIONS[currentStatus] || [];
-      return {
-        ...app,
-        _id: app._id,
-        id: app._id,
-        jobId: app.jobId,
-        userId: app.userId,
-        candidateName: app.candidateName || "Anonymous Candidate",
-        candidateEmail: app.candidateEmail || "—",
-        candidatePhone: app.candidatePhone || "—",
-        candidateCity: app.candidateCity || "Not Provided",
-        candidateAvatarUrl: app.candidateAvatarUrl || null,
-        candidateSkills: app.candidateSkills || [],
-        candidateLanguages: app.candidateLanguages || [],
-        candidateJobTitle: app.candidateJobTitle || "",
-        candidateExperience: app.candidateExperience || "",
-        candidateEducation: app.candidateEducation || {},
-        matchPercentage: app.matchPercentage || 0,
-        appliedAt: app.appliedAt || app.createdAt,
-        status: currentStatus,
-        milestones: app.milestones || [],
-        recruiter: recruiter
-          ? {
-              id: recruiter._id,
-              name: recruiter.name,
-              email: recruiter.email,
-              mobileNumber: recruiter.mobileNumber,
-              whatsappNumber: recruiter.whatsappNumber,
-              designation: recruiter.designation,
-              companyName: recruiter.companyProfile?.name || job.companyName,
-              profileImageUrl:
-                recruiter.profileImage?.url || recruiter.avatar?.url || null,
-              verified: recruiter.verified || recruiter.isVerified || false,
-            }
-          : null,
-        jobDetails: {
-          id: job._id,
-          title: job.title,
-          companyName: job.companyName,
-          companyLogo: job.companyLogo?.url || job.companyLogo || null,
-          location:
-            typeof job.location === "object" ? job.location.city : job.location,
-          workMode: job.workMode,
-          jobType: job.jobType,
-        },
-        workflow: {
-          currentStatus,
-          allowedNextStatuses: allowedNext,
-          isTerminal: allowedNext.length === 0,
-        },
-      };
-    });
+    const allJobs = await JobModel.find({}).lean();
+    for (const j of allJobs) {
+      const recId = j.recruiterId ? j.recruiterId.toString() : null;
+      let targetCompany = null;
+      
+      if (recId) {
+        for (const [id, comp] of companyMap.entries()) {
+          if (comp.recruiterId === recId) {
+            targetCompany = comp;
+            break;
+          }
+        }
+      }
 
-    return res.status(200).json({ success: true, data: enriched });
+      if (targetCompany) {
+        targetCompany.jobCount += 1;
+        
+        const jobIdStr = j._id.toString();
+        const appCount = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] } });
+        const pending = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: { $in: ["Applied", "Viewed"] } });
+        const short = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: { $in: ["Shortlisted", "Interview", "Offered"] } });
+        const hired = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: "Hired" });
+        const rej = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: { $in: ["Rejected", "Withdrawn"] } });
+
+        targetCompany.applicationCount += appCount;
+        targetCompany.pendingCount += pending;
+        targetCompany.shortlistedCount += short;
+        targetCompany.hiredCount += hired;
+        targetCompany.rejectedCount += rej;
+      }
+    }
+
+    const data = Array.from(companyMap.values());
+    return res.status(200).json({ success: true, data });
   } catch (err) {
-    console.error("[getJobApplicationsForAdmin]", err);
+    console.error("getCompaniesWithStats Error:", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 };
 
-// ═══════════════════════════════════════════════════════════
-// JOBS BY SPECIFIC RECRUITER (ADMIN VIEW)
-// ═══════════════════════════════════════════════════════════
+/**
+ * Admin: Get jobs posted by a company (via recruiter association)
+ */
+exports.getJobsByCompany = async (req, res) => {
+  try {
+    const { companyId } = req.params;
+    const recruiters = await Recruiter.find({ 
+      $or: [{ companyId }, { _id: companyId }] 
+    }).lean();
+
+    if (!recruiters || recruiters.length === 0) {
+      return res.status(200).json({ success: true, data: [] });
+    }
+
+    const recruiterIds = recruiters.map(r => r._id.toString());
+    const jobs = await Job.find({ 
+      recruiterId: { $in: recruiterIds.map(id => {
+        try { return new mongoose.Types.ObjectId(id); } catch { return id; }
+      }).concat(recruiterIds) }
+    }).lean();
+
+    const ApplicationModel = getApplicationModel();
+    const enriched = [];
+
+    for (const j of jobs) {
+      const jobIdStr = j._id.toString();
+      const total = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] } });
+      const pending = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: { $in: ["Applied", "Viewed"] } });
+      const hired = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: "Hired" });
+
+      enriched.push({
+        ...j,
+        applicationCount: total,
+        pendingCount: pending,
+        hiredCount: hired
+      });
+    }
+
+    return res.status(200).json({ success: true, data: enriched });
+  } catch (err) {
+    console.error("getJobsByCompany Error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+/**
+ * Admin: Fetch applicants for a particular Job ID
+ */
+exports.getJobApplicationsForAdmin = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const ApplicationModel = getApplicationModel();
+    
+    const apps = await ApplicationModel.find({ 
+      jobId: { $in: [jobId, { toString: () => jobId }] } 
+    }).lean();
+
+    const formatted = apps.map(app => ({
+      ...app,
+      workflow: getWorkflowMeta(app.status)
+    }));
+
+    return res.status(200).json({ success: true, data: formatted });
+  } catch (err) {
+    console.error("getJobApplicationsForAdmin Error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+/**
+ * Admin: Fetch jobs posted by a specific recruiter profile
+ */
 exports.getRecruiterJobsForAdmin = async (req, res) => {
   try {
     const { recruiterId } = req.params;
-    if (!recruiterId || recruiterId === "undefined" || recruiterId === "null") {
-      return res.status(400).json({ success: false, message: "Invalid Recruiter ID" });
+    const queryId = recruiterId;
+
+    const jobs = await Job.find({
+      recruiterId: { $in: [queryId, { toString: () => queryId }] }
+    }).lean();
+
+    const ApplicationModel = getApplicationModel();
+    const enriched = [];
+
+    for (const j of jobs) {
+      const jobIdStr = j._id.toString();
+      const total = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] } });
+      const pending = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: { $in: ["Applied", "Viewed"] } });
+      const hired = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: "Hired" });
+
+      enriched.push({
+        ...j,
+        applicationCount: total,
+        pendingCount: pending,
+        hiredCount: hired
+      });
     }
-
-    const recruiter = await Recruiter.findById(recruiterId).lean();
-    if (!recruiter) {
-      return res.status(404).json({ success: false, message: "Recruiter not found" });
-    }
-
-    const companyName = recruiter.companyProfile?.name || recruiter.companyName;
-    const query = {
-      $or: [
-        { recruiterId },
-        { userId: recruiterId },
-        { createdBy: recruiterId },
-        { postedBy: recruiterId },
-      ],
-    };
-    if (companyName) {
-      query.$or.push({ companyName });
-      query.$or.push({ company: companyName });
-    }
-
-    const jobs = await Job.find(query).sort({ createdAt: -1 }).lean();
-    const Application = getApplicationModel();
-
-    const enriched = await Promise.all(
-      jobs.map(async (j) => {
-        const apps = await Application.find({ jobId: j._id.toString() }).select("status").lean();
-        const stats = buildStats(apps);
-
-        return {
-          _id: j._id,
-          id: j._id,
-          title: j.title || "Untitled Job",
-          companyName: j.companyName || companyName || "",
-          status: j.status || "Live",
-          approvalStatus: j.approvalStatus || "approved",
-          jobType: j.jobType || "Full-Time",
-          workMode: j.workMode || "On-site",
-          location:
-            typeof j.location === "object"
-              ? [j.location.city, j.location.state].filter(Boolean).join(", ")
-              : j.location || "Remote",
-          postedAt: j.postedAt || j.createdAt,
-          applicationCount: stats.total,
-          pendingCount: stats.pending,
-          shortlistedCount: stats.shortlisted,
-          interviewCount: stats.interview,
-          hiredCount: stats.hired,
-          rejectedCount: stats.rejected,
-          applicationStats: stats,
-        };
-      })
-    );
 
     return res.status(200).json({ success: true, data: enriched });
   } catch (err) {
-    console.error("[getRecruiterJobsForAdmin]", err);
+    console.error("getRecruiterJobsForAdmin Error:", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 };
 
-// ═══════════════════════════════════════════════════════════
-// ADMIN-POSTED JOBS (jobs with no recruiter OR postedBy=admin)
-// ═══════════════════════════════════════════════════════════
+/**
+ * Admin: Get ALL jobs posted directly by Admin panel with aggressive fallback detection
+ */
 exports.getAdminPostedJobs = async (req, res) => {
   try {
+    const JobModel = Job;
+    const ApplicationModel = getApplicationModel();
+
+    // Aggressive multi-field check to scan for jobs lacking active recruiter associations or explicitly flagged as Admin
     const query = {
       $or: [
-        { postedBy: "admin" },
-        { postedBy: "Admin" },
-        { postedBy: "ADMIN" },
-        { createdBy: "admin" },
-        { createdBy: "Admin" },
-        { source: "admin" },
+        { postedBy: { $regex: /^admin$/i } },
+        { createdBy: { $regex: /^admin$/i } },
+        { source: { $regex: /^admin$/i } },
         { isAdminPost: true },
-        { recruiterId: { $exists: false } },
+        { isAdmin: true },
         { recruiterId: null },
         { recruiterId: "" },
-      ],
+        { recruiterId: { $exists: false } }
+      ]
     };
 
-    const jobs = await Job.find(query).sort({ createdAt: -1 }).lean();
-    const Application = getApplicationModel();
+    const totalCount = await JobModel.countDocuments({});
+    const jobs = await JobModel.find(query).lean();
 
-    const enriched = await Promise.all(
-      jobs.map(async (j) => {
-        const apps = await Application.find({ jobId: j._id.toString() }).select("status").lean();
-        const stats = buildStats(apps);
+    console.log(`[AdminJobs API] Searched Database. Total jobs in DB: ${totalCount}. Matched Admin criteria: ${jobs.length}`);
 
-        let locationStr = "Remote";
-        if (j.location) {
-          if (typeof j.location === "object") {
-            locationStr =
-              [j.location.city, j.location.state].filter(Boolean).join(", ") || "Remote";
-          } else {
-            locationStr = j.location;
-          }
-        }
+    const enriched = [];
+    for (const j of jobs) {
+      const jobIdStr = j._id.toString();
+      const total = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] } });
+      const pending = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: { $in: ["Applied", "Viewed"] } });
+      const hired = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: "Hired" });
 
-        return {
-          _id: j._id,
-          id: j._id,
-          title: j.title || "Untitled Job",
-          companyName: j.companyName || "Smile Jobs (Admin)",
-          companyLogo: j.companyLogo?.url || j.companyLogo || null,
-          location: locationStr,
-          status: j.status || "Live",
-          approvalStatus: j.approvalStatus || "approved",
-          jobType: j.jobType || "Full-Time",
-          workMode: j.workMode || "On-site",
-          postedAt: j.postedAt || j.createdAt,
-          createdAt: j.createdAt,
-          applicationCount: stats.total,
-          pendingCount: stats.pending,
-          shortlistedCount: stats.shortlisted,
-          hiredCount: stats.hired,
-          rejectedCount: stats.rejected,
-          applicationStats: stats,
-        };
-      })
-    );
+      enriched.push({
+        ...j,
+        applicationCount: total,
+        pendingCount: pending,
+        hiredCount: hired
+      });
+    }
 
     return res.status(200).json({ success: true, data: enriched });
   } catch (err) {
-    console.error("[getAdminPostedJobs]", err);
+    console.error("getAdminPostedJobs Error:", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 };
 
-// ═══════════════════════════════════════════════════════════
-// UPDATE APPLICATION STATUS (ADMIN WORKFLOW TRANSITION)
-// ═══════════════════════════════════════════════════════════
+/**
+ * Admin: Mutate status workflow with legacy validation sync
+ */
 exports.updateApplicationStatusByAdmin = async (req, res) => {
   try {
     const { applicationId } = req.params;
     const { status, hrNotes } = req.body;
 
-    if (!status) {
-      return res.status(400).json({ success: false, message: "New status is required" });
+    const ApplicationModel = getApplicationModel();
+    const app = await ApplicationModel.findById(applicationId);
+
+    if (!app) {
+      return res.status(404).json({ success: false, message: "Application record not found" });
     }
 
-    const validStatuses = Object.keys(WORKFLOW_TRANSITIONS);
-    if (!validStatuses.includes(status)) {
+    // Ensure state machine allows the change
+    const meta = getWorkflowMeta(app.status);
+    if (!meta.allowedNextStatuses.includes(status) && app.status !== status) {
       return res.status(400).json({
         success: false,
-        message: `Invalid status. Allowed: ${validStatuses.join(", ")}`,
+        message: `Status transition from '${app.status}' to '${status}' is prohibited.`
       });
     }
 
-    const Application = getApplicationModel();
-    const application = await Application.findById(applicationId);
-    if (!application) {
-      return res.status(404).json({ success: false, message: "Application not found" });
-    }
+    const category = getCategoryForStatus(status);
 
-    // Backward-compatible legacy category mapping
-    let category = "pending";
-    const lowerS = status.toLowerCase();
-    if (lowerS === "applied" || lowerS === "viewed") category = "pending";
-    else if (lowerS === "shortlisted" || lowerS === "interview" || lowerS === "offered")
-      category = "shortlisted";
-    else if (lowerS === "hired") category = "hired";
-    else if (lowerS === "rejected" || lowerS === "withdrawn") category = "rejected";
-
-    const milestone = {
-      title: `Moved to ${status}`,
-      time: new Date(),
-      completed: true,
-      statusText: hrNotes || "Status updated by Admin Panel",
-      isHighlight: ["Shortlisted", "Interview", "Offered", "Hired"].includes(status),
-    };
-
-    const updateDoc = {
-      $set: {
-        status,
-        category,
-        ...(hrNotes ? { hrNotes } : {}),
+    const updated = await ApplicationModel.findByIdAndUpdate(
+      applicationId,
+      {
+        $set: {
+          status,
+          category,
+          hrNotes: hrNotes || app.hrNotes || "Updated by Admin Panel"
+        },
+        $push: {
+          milestones: {
+            title: `Moved to ${status}`,
+            time: new Date().toLocaleString(),
+            completed: true,
+            statusText: status,
+            isHighlight: status === "Hired" || status === "Rejected"
+          }
+        }
       },
-      $push: { milestones: milestone },
-    };
-
-    const updated = await Application.findByIdAndUpdate(applicationId, updateDoc, {
-      new: true,
-    }).lean();
+      { new: true }
+    ).lean();
 
     return res.status(200).json({
       success: true,
-      message: `Application successfully transitioned to ${status}`,
-      data: updated,
+      data: {
+        ...updated,
+        workflow: getWorkflowMeta(status)
+      }
     });
   } catch (err) {
-    console.error("[updateApplicationStatusByAdmin]", err);
+    console.error("updateApplicationStatusByAdmin Error:", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 };
 
-// ═══════════════════════════════════════════════════════════
-// RECRUITER SELF ENDPOINTS (LEGACY)
-// ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// RECRUITER SELF MANAGEMENT ENDPOINTS (LEGACY BACKWARD COMPATIBLE)
+// ═══════════════════════════════════════════════════════════════
 exports.getRecruiterJobsWithStats = async (req, res) => {
   try {
-    const recruiterId = req.user?.id || req.user?._id;
-    if (!recruiterId) {
-      return res.status(401).json({ success: false, message: "Unauthorized" });
+    const recruiterId = req.user.id;
+    const jobs = await Job.find({ recruiterId }).lean();
+    const ApplicationModel = getApplicationModel();
+
+    const data = [];
+    for (const j of jobs) {
+      const jobIdStr = j._id.toString();
+      const total = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] } });
+      const pending = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: { $in: ["Applied", "Viewed"] } });
+      const hired = await ApplicationModel.countDocuments({ jobId: { $in: [j._id, jobIdStr] }, status: "Hired" });
+
+      data.push({
+        ...j,
+        applicationCount: total,
+        pendingCount: pending,
+        hiredCount: hired
+      });
     }
-
-    const jobs = await Job.find({ recruiterId: recruiterId.toString() })
-      .sort({ createdAt: -1 })
-      .lean();
-    const Application = getApplicationModel();
-
-    const data = await Promise.all(
-      jobs.map(async (j) => {
-        const apps = await Application.find({ jobId: j._id.toString() }).select("status").lean();
-        const stats = buildStats(apps);
-
-        return {
-          ...j,
-          applicationCount: stats.total,
-          pendingCount: stats.pending,
-          shortlistedCount: stats.shortlisted,
-          hiredCount: stats.hired,
-          rejectedCount: stats.rejected,
-          applicationStats: stats,
-        };
-      })
-    );
 
     return res.status(200).json({ success: true, data });
   } catch (err) {
-    console.error("[getRecruiterJobsWithStats]", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 };
@@ -630,11 +391,16 @@ exports.getRecruiterJobsWithStats = async (req, res) => {
 exports.getRecruiterJobApplications = async (req, res) => {
   try {
     const { jobId } = req.params;
-    const Application = getApplicationModel();
-    const applications = await Application.find({ jobId }).sort({ appliedAt: -1 }).lean();
-    return res.status(200).json({ success: true, data: applications });
+    const ApplicationModel = getApplicationModel();
+    const apps = await ApplicationModel.find({ jobId }).lean();
+
+    const formatted = apps.map(app => ({
+      ...app,
+      workflow: getWorkflowMeta(app.status)
+    }));
+
+    return res.status(200).json({ success: true, data: formatted });
   } catch (err) {
-    console.error("[getRecruiterJobApplications]", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 };
