@@ -1,621 +1,666 @@
-// FILE: backend/src/controllers/applicationHierarchyController.js
-// ═══════════════════════════════════════════════════════════════
-// APPLICATION HIERARCHY CONTROLLER
-// Provides drill-down navigation: Company → Job → Application
-// Uses Option A: groups by recruiterId → companyId chain
-// No schema changes required.
-// ═══════════════════════════════════════════════════════════════
-
 const mongoose = require("mongoose");
-const Company = require("../models/Company");
 const Recruiter = require("../models/Recruiter");
 const Job = require("../models/Job");
-const Application = require("../models/Application"); // Corrected to uppercase 'A' to match your models/Application.js
+const Application = require("../models/Application");
 
-// ═══════════════════════════════════════════════════════════════
-// HELPER: Get all recruiter ObjectIds belonging to a company
-// ═══════════════════════════════════════════════════════════════
-const getRecruiterIdsForCompany = async (companyId) => {
-  const recruiters = await Recruiter.find({ companyId })
-    .select("_id")
-    .lean();
-  return recruiters.map((r) => r._id);
-};
+let Company = null;
+try {
+  Company = require("../models/Company");
+} catch (e) {
+  Company = null;
+}
 
-// ═══════════════════════════════════════════════════════════════
-// HELPER: Get all recruiter ObjectIds for multiple companies
-// Returns Map<companyIdString, recruiterIdObject[]>
-// ═══════════════════════════════════════════════════════════════
-const getRecruiterIdsForCompanies = async (companyIds) => {
-  if (!companyIds.length) return new Map();
+/**
+ * Helper: Normalizes application status counts into standardized buckets
+ */
+function createEmptyStats() {
+  return {
+    total: 0,
+    pending: 0,
+    viewed: 0,
+    shortlisted: 0,
+    interview: 0,
+    offered: 0,
+    hired: 0,
+    rejected: 0,
+  };
+}
 
-  const recruiters = await Recruiter.find({
-    companyId: { $in: companyIds },
-  })
-    .select("_id companyId")
-    .lean();
+function accumulateStatus(statsObj, status, count = 1) {
+  const s = String(status || "").trim().toLowerCase();
+  statsObj.total += count;
 
-  const map = new Map();
-  companyIds.forEach((cid) => map.set(cid.toString(), []));
+  if (s === "applied" || s === "pending") {
+    statsObj.pending += count;
+  } else if (s === "viewed") {
+    statsObj.viewed += count;
+  } else if (s === "shortlisted") {
+    statsObj.shortlisted += count;
+  } else if (s === "interview" || s === "interviewing" || s === "scheduled") {
+    statsObj.interview += count;
+  } else if (s === "offered" || s === "offer") {
+    statsObj.offered += count;
+  } else if (s === "hired" || s === "accepted") {
+    statsObj.hired += count;
+  } else if (s === "rejected" || s === "declined" || s === "withdrawn") {
+    statsObj.rejected += count;
+  } else {
+    statsObj.pending += count;
+  }
+}
 
-  recruiters.forEach((r) => {
-    if (r.companyId) {
-      const key = r.companyId.toString();
-      if (map.has(key)) {
-        map.get(key).push(r._id);
-      }
-    }
-  });
-
-  return map;
-};
-
-// ═══════════════════════════════════════════════════════════════
-// HELPER: Get application counts grouped by jobId
-// Uses MongoDB aggregation for scale (500K+ records)
-// ═══════════════════════════════════════════════════════════════
-const getApplicationCountsByJobIds = async (jobIds) => {
-  if (!jobIds.length) return new Map();
-
-  const objectIdJobIds = jobIds
-    .filter((id) => mongoose.Types.ObjectId.isValid(id))
-    .map((id) =>
-      typeof id === "string" ? new mongoose.Types.ObjectId(id) : id
-    );
-
-  if (!objectIdJobIds.length) return new Map();
-
-  const result = await Application.aggregate([
-    { $match: { jobId: { $in: objectIdJobIds } } },
-    {
-      $group: {
-        _id: "$jobId",
-        total: { $sum: 1 },
-        pending: {
-          $sum: { $cond: [{ $eq: ["$status", "Applied"] }, 1, 0] },
-        },
-        viewed: {
-          $sum: { $cond: [{ $eq: ["$status", "Viewed"] }, 1, 0] },
-        },
-        shortlisted: {
-          $sum: { $cond: [{ $eq: ["$status", "Shortlisted"] }, 1, 0] },
-        },
-        interview: {
-          $sum: { $cond: [{ $eq: ["$status", "Interview"] }, 1, 0] },
-        },
-        offered: {
-          $sum: { $cond: [{ $eq: ["$status", "Offered"] }, 1, 0] },
-        },
-        hired: {
-          $sum: { $cond: [{ $eq: ["$status", "Hired"] }, 1, 0] },
-        },
-        rejected: {
-          $sum: { $cond: [{ $eq: ["$status", "Rejected"] }, 1, 0] },
-        },
-      },
-    },
-  ]);
-
-  const map = new Map();
-  result.forEach((r) => {
-    map.set(r._id.toString(), {
-      total: r.total,
-      pending: r.pending,
-      viewed: r.viewed,
-      shortlisted: r.shortlisted,
-      interview: r.interview,
-      offered: r.offered,
-      hired: r.hired,
-      rejected: r.rejected,
-    });
-  });
-
-  return map;
-};
-
-// ═══════════════════════════════════════════════════════════════
-// ADMIN LEVEL 1: Get all companies with job & application stats
-// GET /api/v1/applications/hierarchy/companies
-// ═══════════════════════════════════════════════════════════════
-const getCompaniesWithStats = async (req, res) => {
+/**
+ * @desc    Get all companies/recruiters with aggregated job & application counts
+ * @route   GET /api/v1/applications/hierarchy/companies
+ * @access  Private (Admin / Super Admin)
+ */
+exports.getCompaniesWithStats = async (req, res) => {
   try {
-    const {
-      search,
-      page = 1,
-      limit = 20,
-      sortBy = "name",
-      sortOrder = "asc",
-    } = req.query;
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const skip = (page - 1) * limit;
 
-    const pageNum = Math.max(1, parseInt(page));
-    const limitNum = Math.max(1, Math.min(100, parseInt(limit)));
-    const skip = (pageNum - 1) * limitNum;
+    const { search, status, verified, industry } = req.query;
 
-    const filter = {};
+    // 1. Build Recruiter search/filter query
+    const recruiterQuery = {};
+
     if (search && search.trim()) {
-      const s = search.trim();
-      filter.$or = [
-        { name: { $regex: s, $options: "i" } },
-        { industry: { $regex: s, $options: "i" } },
-        { "address.city": { $regex: s, $options: "i" } },
+      const regex = new RegExp(search.trim(), "i");
+      recruiterQuery.$or = [
+        { name: regex },
+        { email: regex },
+        { companyName: regex },
+        { "companyProfile.name": regex },
+        { "companyProfile.industry": regex },
+        { "companyProfile.city": regex },
+        { "companyProfile.headquarters": regex },
       ];
     }
 
-    const sortObj = { [sortBy]: sortOrder === "desc" ? -1 : 1 };
+    if (verified === "true") {
+      recruiterQuery.$or = [
+        ...(recruiterQuery.$or || []),
+        { isVerified: true },
+        { verificationStatus: "approved" },
+      ];
+    } else if (verified === "false") {
+      recruiterQuery.isVerified = false;
+      recruiterQuery.verificationStatus = { $ne: "approved" };
+    }
 
-    const [companies, totalCompanies] = await Promise.all([
-      Company.find(filter)
-        .select(
-          "name logo industry address website verified isActive recruiterId"
-        )
-        .sort(sortObj)
+    if (industry && industry.trim()) {
+      recruiterQuery["companyProfile.industry"] = new RegExp(industry.trim(), "i");
+    }
+
+    // 2. Fetch Recruiters matching query
+    const [totalRecruiters, recruiters] = await Promise.all([
+      Recruiter.countDocuments(recruiterQuery),
+      Recruiter.find(recruiterQuery)
+        .sort({ createdAt: -1 })
         .skip(skip)
-        .limit(limitNum)
+        .limit(limit)
         .lean(),
-      Company.countDocuments(filter),
     ]);
 
-    if (companies.length === 0) {
+    if (!recruiters || recruiters.length === 0) {
       return res.status(200).json({
         success: true,
-        data: [],
+        count: 0,
         pagination: {
-          page: pageNum,
-          limit: limitNum,
-          total: totalCompanies,
-          pages: Math.ceil(totalCompanies / limitNum) || 1,
+          page,
+          limit,
+          totalPages: 0,
+          totalResults: 0,
+          hasNextPage: false,
+          hasPrevPage: false,
         },
+        data: [],
       });
     }
 
-    const companyIds = companies.map((c) => c._id);
-    const recruiterMap = await getRecruiterIdsForCompanies(companyIds);
-
-    const allRecruiterIds = [];
-    recruiterMap.forEach((rIds) => {
-      rIds.forEach((rid) => allRecruiterIds.push(rid));
+    // 3. Collect recruiter IDs (both ObjectId and String formats for bulletproof matching)
+    const recruiterIds = [];
+    const recruiterIdStrings = [];
+    recruiters.forEach((r) => {
+      recruiterIds.push(r._id);
+      recruiterIdStrings.push(r._id.toString());
     });
 
-    companies.forEach((c) => {
-      if (
-        c.recruiterId &&
-        !allRecruiterIds.some(
-          (rid) => rid.toString() === c.recruiterId.toString()
-        )
-      ) {
-        allRecruiterIds.push(c.recruiterId);
+    // 4. Fetch all jobs belonging to these recruiters from Job_db
+    const allJobs = await Job.find({
+      $or: [
+        { recruiterId: { $in: recruiterIds } },
+        { recruiterId: { $in: recruiterIdStrings } },
+      ],
+    })
+      .select("_id recruiterId title status isActive companyName")
+      .lean();
+
+    // Group jobs by recruiter ID
+    const jobsByRecruiter = new Map();
+    const allJobIds = [];
+
+    allJobs.forEach((job) => {
+      const recIdStr = job.recruiterId ? job.recruiterId.toString() : null;
+      if (recIdStr) {
+        if (!jobsByRecruiter.has(recIdStr)) {
+          jobsByRecruiter.set(recIdStr, []);
+        }
+        jobsByRecruiter.get(recIdStr).push(job);
       }
+      allJobIds.push(job._id);
     });
 
-    let jobsForRecruiters = [];
-    if (allRecruiterIds.length > 0) {
-      jobsForRecruiters = await Job.find({
-        recruiterId: { $in: allRecruiterIds },
-      })
-        .select("_id recruiterId")
-        .lean();
+    // 5. Aggregate Application stats for all these job IDs from application_db
+    const appStatsByJobId = new Map();
+
+    if (allJobIds.length > 0) {
+      const jobObjectIds = allJobIds
+        .map((id) => {
+          try {
+            return mongoose.Types.ObjectId.isValid(id)
+              ? new mongoose.Types.ObjectId(id)
+              : id;
+          } catch (e) {
+            return id;
+          }
+        })
+        .filter(Boolean);
+
+      const appAggregation = await Application.aggregate([
+        {
+          $match: {
+            jobId: { $in: jobObjectIds },
+          },
+        },
+        {
+          $group: {
+            _id: {
+              jobId: "$jobId",
+              status: "$status",
+            },
+            count: { $sum: 1 },
+          },
+        },
+      ]);
+
+      appAggregation.forEach((row) => {
+        const jIdStr = row._id.jobId ? row._id.jobId.toString() : "";
+        if (!jIdStr) return;
+
+        if (!appStatsByJobId.has(jIdStr)) {
+          appStatsByJobId.set(jIdStr, createEmptyStats());
+        }
+        accumulateStatus(appStatsByJobId.get(jIdStr), row._id.status, row.count);
+      });
     }
 
-    const recruiterJobsMap = new Map();
-    jobsForRecruiters.forEach((j) => {
-      if (j.recruiterId) {
-        const key = j.recruiterId.toString();
-        if (!recruiterJobsMap.has(key)) recruiterJobsMap.set(key, []);
-        recruiterJobsMap.get(key).push(j._id.toString());
-      }
-    });
+    // 6. Assemble company records with live aggregated stats
+    const companyList = recruiters.map((recruiter) => {
+      const recIdStr = recruiter._id.toString();
+      const recruiterJobs = jobsByRecruiter.get(recIdStr) || [];
 
-    const companyJobsMap = new Map();
-    companies.forEach((c) => {
-      const cid = c._id.toString();
-      const rIds = recruiterMap.get(cid) || [];
-      const allRIds = [...rIds];
-      if (
-        c.recruiterId &&
-        !allRIds.some(
-          (rid) => rid.toString() === c.recruiterId.toString()
-        )
-      ) {
-        allRIds.push(c.recruiterId);
-      }
+      // Calculate total & active jobs
+      const totalJobs = recruiterJobs.length;
+      const activeJobs = recruiterJobs.filter(
+        (j) =>
+          j.isActive !== false &&
+          j.status !== "Closed" &&
+          j.status !== "Draft" &&
+          j.status !== "Inactive"
+      ).length;
 
-      const jobIds = [];
-      allRIds.forEach((rid) => {
-        const rJobs = recruiterJobsMap.get(rid.toString()) || [];
-        jobIds.push(...rJobs);
-      });
-      companyJobsMap.set(cid, jobIds);
-    });
-
-    const allJobIds = jobsForRecruiters.map((j) => j._id.toString());
-    const appCountsMap = await getApplicationCountsByJobIds(allJobIds);
-
-    const data = companies.map((c) => {
-      const cid = c._id.toString();
-      const jobIds = companyJobsMap.get(cid) || [];
-      const recruiterIds = recruiterMap.get(cid) || [];
-
-      let applicationCount = 0;
-      let pendingCount = 0;
-      jobIds.forEach((jid) => {
-        const counts = appCountsMap.get(jid);
-        if (counts) {
-          applicationCount += counts.total;
-          pendingCount += counts.pending;
+      // Sum application stats across all recruiter's jobs
+      const compStats = createEmptyStats();
+      recruiterJobs.forEach((job) => {
+        const jIdStr = job._id.toString();
+        const jobStats = appStatsByJobId.get(jIdStr);
+        if (jobStats) {
+          compStats.total += jobStats.total;
+          compStats.pending += jobStats.pending;
+          compStats.viewed += jobStats.viewed;
+          compStats.shortlisted += jobStats.shortlisted;
+          compStats.interview += jobStats.interview;
+          compStats.offered += jobStats.offered;
+          compStats.hired += jobStats.hired;
+          compStats.rejected += jobStats.rejected;
         }
       });
 
-      const initials = (c.name || "??")
-        .split(" ")
-        .map((w) => (w && w[0]) || "")
-        .join("")
-        .toUpperCase()
-        .slice(0, 2);
+      // Extract Company Name & Logo with multiple fallbacks
+      const profile = recruiter.companyProfile || {};
+      const companyName =
+        profile.name ||
+        recruiter.companyName ||
+        recruiter.name ||
+        "Unnamed Company";
+
+      const logo = {
+        url:
+          profile.logo?.url ||
+          profile.logo ||
+          recruiter.avatar?.url ||
+          "",
+        publicId: profile.logo?.publicId || recruiter.avatar?.public_id || "",
+      };
+
+      const industryVal = profile.industry || "General";
+      const city = profile.city || profile.headquarters || "";
+      const state = profile.state || "";
+      const country = profile.country || "India";
+
+      const isVerified = Boolean(
+        recruiter.isVerified ||
+          recruiter.verificationStatus === "approved" ||
+          recruiter.verified
+      );
 
       return {
-        companyId: cid,
-        companyName: c.name,
-        companyLogo: c.logo?.url || null,
-        companyInitials: initials,
-        industry: c.industry || "",
-        city: c.address?.city || "",
-        state: c.address?.state || "",
-        website: c.website || "",
-        verified: c.verified || false,
-        isActive: c.isActive !== false,
-        recruiterCount: recruiterIds.length,
-        jobCount: jobIds.length,
-        applicationCount,
-        pendingCount,
+        _id: recruiter._id,
+        name: companyName,
+        companyName: companyName,
+        recruiterName: recruiter.name || "",
+        recruiterEmail: recruiter.email || "",
+        logo: logo,
+        industry: industryVal,
+        address: {
+          city,
+          state,
+          country,
+        },
+        verified: isVerified,
+        isActive: recruiter.isActive !== false,
+        recruiterId: {
+          _id: recruiter._id,
+          name: recruiter.name || "",
+          email: recruiter.email || "",
+        },
+        recruiterCount: 1,
+        totalJobs,
+        activeJobs,
+        applicationStats: compStats,
+        createdAt: recruiter.createdAt,
       };
     });
 
-    res.status(200).json({
+    const totalPages = Math.ceil(totalRecruiters / limit);
+
+    return res.status(200).json({
       success: true,
-      data,
+      count: companyList.length,
       pagination: {
-        page: pageNum,
-        limit: limitNum,
-        total: totalCompanies,
-        pages: Math.ceil(totalCompanies / limitNum) || 1,
+        page,
+        limit,
+        totalPages,
+        totalResults: totalRecruiters,
+        hasNextPage: page < totalPages,
+        hasPrevPage: page > 1,
       },
+      data: companyList,
     });
   } catch (error) {
-    console.error("Get Companies With Stats Error:", error.message);
-    res.status(500).json({
+    console.error("Hierarchy getCompaniesWithStats error:", error);
+    return res.status(500).json({
       success: false,
-      message: "Server error while fetching company hierarchy",
+      message: "Failed to fetch companies hierarchy",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 };
 
-// ═══════════════════════════════════════════════════════════════
-// ADMIN LEVEL 2: Get jobs for a specific company with app stats
-// GET /api/v1/applications/hierarchy/companies/:companyId/jobs
-// ═══════════════════════════════════════════════════════════════
-const getJobsByCompany = async (req, res) => {
+/**
+ * @desc    Get all jobs for a specific company / recruiter with application counts
+ * @route   GET /api/v1/applications/hierarchy/companies/:companyId/jobs
+ * @access  Private (Admin / Super Admin)
+ */
+exports.getJobsByCompany = async (req, res) => {
   try {
     const { companyId } = req.params;
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const skip = (page - 1) * limit;
 
-    if (!mongoose.Types.ObjectId.isValid(companyId)) {
+    const { search, status, jobType, workMode } = req.query;
+
+    if (!companyId) {
       return res.status(400).json({
         success: false,
-        message: "Invalid company ID",
+        message: "companyId parameter is required",
       });
     }
 
-    const company = await Company.findById(companyId)
-      .select("name recruiterId")
-      .lean();
-    if (!company) {
-      return res.status(404).json({
-        success: false,
-        message: "Company not found",
+    // 1. Fetch Recruiter or Company info for header display
+    let recruiter = null;
+    try {
+      if (mongoose.Types.ObjectId.isValid(companyId)) {
+        recruiter = await Recruiter.findById(companyId).lean();
+      }
+    } catch (e) {
+      recruiter = null;
+    }
+
+    // 2. Build Job search criteria
+    const candidateIds = [companyId];
+    if (mongoose.Types.ObjectId.isValid(companyId)) {
+      candidateIds.push(new mongoose.Types.ObjectId(companyId));
+    }
+
+    const jobQuery = {
+      $or: [
+        { recruiterId: { $in: candidateIds } },
+        { companyId: { $in: candidateIds } },
+      ],
+    };
+
+    // If recruiter has a known companyName and no recruiterId matches, fallback to companyName
+    if (recruiter && (recruiter.companyName || recruiter.companyProfile?.name)) {
+      const cName = recruiter.companyProfile?.name || recruiter.companyName;
+      jobQuery.$or.push({
+        companyName: new RegExp(`^${cName.trim()}$`, "i"),
       });
     }
 
-    const {
-      search,
-      status,
-      page = 1,
-      limit = 20,
-      sortBy = "createdAt",
-      sortOrder = "desc",
-    } = req.query;
-
-    const pageNum = Math.max(1, parseInt(page));
-    const limitNum = Math.max(1, Math.min(100, parseInt(limit)));
-    const skip = (pageNum - 1) * limitNum;
-
-    const recruiterIds = await getRecruiterIdsForCompany(
-      new mongoose.Types.ObjectId(companyId)
-    );
-
-    if (
-      company.recruiterId &&
-      !recruiterIds.some(
-        (rid) => rid.toString() === company.recruiterId.toString()
-      )
-    ) {
-      recruiterIds.push(company.recruiterId);
-    }
-
-    if (recruiterIds.length === 0) {
-      return res.status(200).json({
-        success: true,
-        data: [],
-        companyName: company.name,
-        pagination: {
-          page: pageNum,
-          limit: limitNum,
-          total: 0,
-          pages: 1,
-        },
-      });
-    }
-
-    const filter = { recruiterId: { $in: recruiterIds } };
     if (search && search.trim()) {
-      const s = search.trim();
-      filter.$or = [
-        { title: { $regex: s, $options: "i" } },
-        { "location.city": { $regex: s, $options: "i" } },
-        { department: { $regex: s, $options: "i" } },
+      const sRegex = new RegExp(search.trim(), "i");
+      jobQuery.$and = [
+        ...(jobQuery.$and || []),
+        {
+          $or: [
+            { title: sRegex },
+            { "location.city": sRegex },
+            { "location.address": sRegex },
+            { jobType: sRegex },
+          ],
+        },
       ];
     }
-    if (status && status !== "all" && status !== "All") {
-      filter.status = status;
+
+    if (status && status !== "all") {
+      jobQuery.status = status;
     }
 
-    const sortObj = { [sortBy]: sortOrder === "desc" ? -1 : 1 };
+    if (jobType && jobType !== "all") {
+      jobQuery.jobType = jobType;
+    }
 
-    const [jobs, totalJobs] = await Promise.all([
-      Job.find(filter)
-        .select(
-          "_id title recruiterId companyName status isActive jobType workMode location salary experience postedAt createdAt approvalStatus"
-        )
-        .sort(sortObj)
+    if (workMode && workMode !== "all") {
+      jobQuery.workMode = workMode;
+    }
+
+    // 3. Fetch Jobs with pagination
+    const [totalJobs, jobs] = await Promise.all([
+      Job.countDocuments(jobQuery),
+      Job.find(jobQuery)
+        .sort({ createdAt: -1 })
         .skip(skip)
-        .limit(limitNum)
+        .limit(limit)
         .lean(),
-      Job.countDocuments(filter),
     ]);
 
-    if (jobs.length === 0) {
+    if (!jobs || jobs.length === 0) {
       return res.status(200).json({
         success: true,
-        data: [],
-        companyName: company.name,
+        count: 0,
         pagination: {
-          page: pageNum,
-          limit: limitNum,
-          total: totalJobs,
-          pages: Math.ceil(totalJobs / limitNum) || 1,
+          page,
+          limit,
+          totalPages: 0,
+          totalResults: 0,
+          hasNextPage: false,
+          hasPrevPage: false,
         },
+        data: [],
+        company: recruiter
+          ? {
+              _id: recruiter._id,
+              name:
+                recruiter.companyProfile?.name ||
+                recruiter.companyName ||
+                recruiter.name,
+              logo:
+                recruiter.companyProfile?.logo || recruiter.avatar,
+              email: recruiter.email,
+            }
+          : null,
       });
     }
 
-    const jobIds = jobs.map((j) => j._id.toString());
-    const appCountsMap = await getApplicationCountsByJobIds(jobIds);
+    // 4. Aggregate Application Stats for these jobs
+    const jobIds = jobs.map((j) => j._id);
+    const jobObjectIds = jobIds
+      .map((id) => {
+        try {
+          return mongoose.Types.ObjectId.isValid(id)
+            ? new mongoose.Types.ObjectId(id)
+            : id;
+        } catch (e) {
+          return id;
+        }
+      })
+      .filter(Boolean);
 
-    const recruiterDocs = await Recruiter.find({
-      _id: { $in: recruiterIds },
-    })
-      .select("_id name")
-      .lean();
-    const recruiterNameMap = new Map();
-    recruiterDocs.forEach((r) => {
-      recruiterNameMap.set(r._id.toString(), r.name);
+    const appAggregation = await Application.aggregate([
+      {
+        $match: {
+          jobId: { $in: jobObjectIds },
+        },
+      },
+      {
+        $group: {
+          _id: {
+            jobId: "$jobId",
+            status: "$status",
+          },
+          count: { $sum: 1 },
+        },
+      },
+    ]);
+
+    const statsMap = new Map();
+    appAggregation.forEach((row) => {
+      const jIdStr = row._id.jobId ? row._id.jobId.toString() : "";
+      if (!jIdStr) return;
+
+      if (!statsMap.has(jIdStr)) {
+        statsMap.set(jIdStr, createEmptyStats());
+      }
+      accumulateStatus(statsMap.get(jIdStr), row._id.status, row.count);
     });
 
-    const data = jobs.map((j) => {
-      const jid = j._id.toString();
-      const counts = appCountsMap.get(jid) || {
-        total: 0,
-        pending: 0,
-        shortlisted: 0,
-        interview: 0,
-        hired: 0,
-        rejected: 0,
-      };
-
-      let locationDisplay = "";
-      if (j.location) {
-        const parts = [j.location.city, j.location.state].filter(Boolean);
-        locationDisplay = parts.join(", ");
-      }
-
-      let salaryRange = "Not Disclosed";
-      if (j.salary && (j.salary.min || j.salary.max)) {
-        const symbol =
-          j.salary.currency === "INR" ? "₹" : j.salary.currency || "₹";
-        salaryRange = `${symbol} ${j.salary.min || 0} - ${j.salary.max || 0}`;
-      }
+    // 5. Combine jobs with application stats
+    const jobsWithStats = jobs.map((job) => {
+      const jIdStr = job._id.toString();
+      const stats = statsMap.get(jIdStr) || createEmptyStats();
 
       return {
-        jobId: jid,
-        title: j.title,
-        companyName: j.companyName,
-        status: j.status || "Live",
-        isActive: j.isActive !== false,
-        jobType: j.jobType || "Full-Time",
-        workMode: j.workMode || "On-site",
-        location: locationDisplay,
-        salaryRange,
-        experienceText: j.experience?.text || "",
-        approvalStatus: j.approvalStatus || "approved",
-        recruiterName:
-          recruiterNameMap.get(j.recruiterId?.toString()) || "Unknown",
-        recruiterId: j.recruiterId?.toString() || null,
-        applicationCount: counts.total,
-        pendingCount: counts.pending,
-        shortlistedCount: counts.shortlisted,
-        interviewCount: counts.interview,
-        hiredCount: counts.hired,
-        rejectedCount: counts.rejected,
-        postedAt: j.postedAt || j.createdAt,
+        _id: job._id,
+        title: job.title || "Untitled Job",
+        companyName:
+          job.companyName ||
+          recruiter?.companyProfile?.name ||
+          recruiter?.companyName ||
+          "Company",
+        companyLogo:
+          job.companyLogo ||
+          recruiter?.companyProfile?.logo ||
+          recruiter?.avatar ||
+          {},
+        location: job.location || { address: "", city: "", state: "", country: "India" },
+        salary: job.salary || {},
+        experience: job.experience || {},
+        jobType: job.jobType || "Full-time",
+        workMode: job.workMode || "On-site",
+        status: job.status || (job.isActive ? "Live" : "Closed"),
+        isActive: job.isActive !== false,
+        featured: Boolean(job.featured),
+        postedAt: job.postedAt || job.createdAt,
+        createdAt: job.createdAt,
+        applicantsCount: stats.total || job.applicantsCount || 0,
+        applicationStats: stats,
       };
     });
 
-    res.status(200).json({
+    const totalPages = Math.ceil(totalJobs / limit);
+
+    return res.status(200).json({
       success: true,
-      data,
-      companyName: company.name,
+      count: jobsWithStats.length,
       pagination: {
-        page: pageNum,
-        limit: limitNum,
-        total: totalJobs,
-        pages: Math.ceil(totalJobs / limitNum) || 1,
+        page,
+        limit,
+        totalPages,
+        totalResults: totalJobs,
+        hasNextPage: page < totalPages,
+        hasPrevPage: page > 1,
       },
+      data: jobsWithStats,
+      company: recruiter
+        ? {
+            _id: recruiter._id,
+            name:
+              recruiter.companyProfile?.name ||
+              recruiter.companyName ||
+              recruiter.name,
+            logo:
+              recruiter.companyProfile?.logo || recruiter.avatar,
+            email: recruiter.email,
+          }
+        : null,
     });
   } catch (error) {
-    console.error("Get Jobs By Company Error:", error.message);
-    res.status(500).json({
+    console.error("Hierarchy getJobsByCompany error:", error);
+    return res.status(500).json({
       success: false,
-      message: "Server error while fetching jobs for company",
+      message: "Failed to fetch company jobs",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 };
 
-// ═══════════════════════════════════════════════════════════════
-// RECRUITER: Get authenticated recruiter's jobs with app stats
-// GET /api/v1/applications/hierarchy/recruiter/jobs
-// ═══════════════════════════════════════════════════════════════
-const getRecruiterJobsWithStats = async (req, res) => {
+/**
+ * @desc    Get recruiter's own jobs with application stats
+ * @route   GET /api/v1/applications/hierarchy/recruiter/jobs
+ * @access  Private (Recruiter)
+ */
+exports.getRecruiterJobsWithStats = async (req, res) => {
   try {
-    const authUser = req.authUser;
-    if (!authUser || authUser.role !== "recruiter") {
-      return res.status(403).json({
+    const recruiterId = req.user?._id;
+    if (!recruiterId) {
+      return res.status(401).json({
         success: false,
-        message: "Recruiter access required",
+        message: "Not authorized as a recruiter",
       });
     }
 
-    const recruiterId = new mongoose.Types.ObjectId(authUser.id);
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const skip = (page - 1) * limit;
 
-    const {
-      search,
-      status,
-      page = 1,
-      limit = 20,
-      sortBy = "createdAt",
-      sortOrder = "desc",
-    } = req.query;
-
-    const pageNum = Math.max(1, parseInt(page));
-    const limitNum = Math.max(1, Math.min(100, parseInt(limit)));
-    const skip = (pageNum - 1) * limitNum;
-
-    const filter = { recruiterId };
-    if (search && search.trim()) {
-      const s = search.trim();
-      filter.$or = [
-        { title: { $regex: s, $options: "i" } },
-        { "location.city": { $regex: s, $options: "i" } },
-      ];
-    }
-    if (status && status !== "all" && status !== "All") {
-      filter.status = status;
+    const candidateIds = [recruiterId];
+    if (mongoose.Types.ObjectId.isValid(recruiterId)) {
+      candidateIds.push(new mongoose.Types.ObjectId(recruiterId));
     }
 
-    const sortObj = { [sortBy]: sortOrder === "desc" ? -1 : 1 };
+    const jobQuery = {
+      recruiterId: { $in: candidateIds },
+    };
 
-    const [jobs, totalJobs] = await Promise.all([
-      Job.find(filter)
-        .select(
-          "_id title companyName status isActive jobType workMode location salary postedAt createdAt"
-        )
-        .sort(sortObj)
+    if (req.query.search && req.query.search.trim()) {
+      const regex = new RegExp(req.query.search.trim(), "i");
+      jobQuery.$or = [{ title: regex }, { "location.city": regex }];
+    }
+
+    if (req.query.status && req.query.status !== "all") {
+      jobQuery.status = req.query.status;
+    }
+
+    const [totalJobs, jobs] = await Promise.all([
+      Job.countDocuments(jobQuery),
+      Job.find(jobQuery)
+        .sort({ createdAt: -1 })
         .skip(skip)
-        .limit(limitNum)
+        .limit(limit)
         .lean(),
-      Job.countDocuments(filter),
     ]);
 
-    const jobIds = jobs.map((j) => j._id.toString());
-    const appCountsMap = await getApplicationCountsByJobIds(jobIds);
+    const jobIds = jobs.map((j) => j._id);
+    const jobObjectIds = jobIds
+      .map((id) => {
+        try {
+          return mongoose.Types.ObjectId.isValid(id)
+            ? new mongoose.Types.ObjectId(id)
+            : id;
+        } catch (e) {
+          return id;
+        }
+      })
+      .filter(Boolean);
 
-    const data = jobs.map((j) => {
-      const jid = j._id.toString();
-      const counts = appCountsMap.get(jid) || {
-        total: 0,
-        pending: 0,
-        shortlisted: 0,
-        interview: 0,
-        hired: 0,
-        rejected: 0,
-      };
+    const appAggregation = await Application.aggregate([
+      { $match: { jobId: { $in: jobObjectIds } } },
+      {
+        $group: {
+          _id: { jobId: "$jobId", status: "$status" },
+          count: { $sum: 1 },
+        },
+      },
+    ]);
 
-      let locationDisplay = "";
-      if (j.location) {
-        const parts = [j.location.city, j.location.state].filter(Boolean);
-        locationDisplay = parts.join(", ");
-      }
+    const statsMap = new Map();
+    appAggregation.forEach((row) => {
+      const jIdStr = row._id.jobId ? row._id.jobId.toString() : "";
+      if (!jIdStr) return;
+      if (!statsMap.has(jIdStr)) statsMap.set(jIdStr, createEmptyStats());
+      accumulateStatus(statsMap.get(jIdStr), row._id.status, row.count);
+    });
 
+    const jobsWithStats = jobs.map((job) => {
+      const jIdStr = job._id.toString();
+      const stats = statsMap.get(jIdStr) || createEmptyStats();
       return {
-        jobId: jid,
-        title: j.title,
-        companyName: j.companyName,
-        status: j.status || "Live",
-        isActive: j.isActive !== false,
-        jobType: j.jobType || "Full-Time",
-        workMode: j.workMode || "On-site",
-        location: locationDisplay,
-        applicationCount: counts.total,
-        pendingCount: counts.pending,
-        shortlistedCount: counts.shortlisted,
-        interviewCount: counts.interview,
-        hiredCount: counts.hired,
-        rejectedCount: counts.rejected,
-        postedAt: j.postedAt || j.createdAt,
+        ...job,
+        applicantsCount: stats.total,
+        applicationStats: stats,
       };
     });
 
-    res.status(200).json({
+    const totalPages = Math.ceil(totalJobs / limit);
+
+    return res.status(200).json({
       success: true,
-      data,
+      count: jobsWithStats.length,
       pagination: {
-        page: pageNum,
-        limit: limitNum,
-        total: totalJobs,
-        pages: Math.ceil(totalJobs / limitNum) || 1,
+        page,
+        limit,
+        totalPages,
+        totalResults: totalJobs,
+        hasNextPage: page < totalPages,
+        hasPrevPage: page > 1,
       },
+      data: jobsWithStats,
     });
   } catch (error) {
-    console.error("Get Recruiter Jobs Error:", error.message);
-    res.status(500).json({
+    console.error("Hierarchy getRecruiterJobsWithStats error:", error);
+    return res.status(500).json({
       success: false,
-      message: "Server error while fetching recruiter jobs",
+      message: "Failed to fetch recruiter jobs",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 };
 
-// ═══════════════════════════════════════════════════════════════
-// RECRUITER: Get applications for a specific job (with ownership)
-// GET /api/v1/applications/hierarchy/recruiter/jobs/:jobId/applications
-// ═══════════════════════════════════════════════════════════════
-const getRecruiterJobApplications = async (req, res) => {
+/**
+ * @desc    Get applications for a recruiter's job
+ * @route   GET /api/v1/applications/hierarchy/recruiter/jobs/:jobId/applications
+ * @access  Private (Recruiter)
+ */
+exports.getRecruiterJobApplications = async (req, res) => {
   try {
-    const authUser = req.authUser;
-    if (!authUser || authUser.role !== "recruiter") {
-      return res.status(403).json({
-        success: false,
-        message: "Recruiter access required",
-      });
-    }
-
+    const recruiterId = req.user?._id;
     const { jobId } = req.params;
-    if (!mongoose.Types.ObjectId.isValid(jobId)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid job ID",
-      });
-    }
 
-    const job = await Job.findById(jobId)
-      .select("recruiterId title companyName")
-      .lean();
-
+    const job = await Job.findById(jobId).lean();
     if (!job) {
       return res.status(404).json({
         success: false,
@@ -623,83 +668,49 @@ const getRecruiterJobApplications = async (req, res) => {
       });
     }
 
-    if (job.recruiterId?.toString() !== authUser.id.toString()) {
+    if (
+      job.recruiterId &&
+      job.recruiterId.toString() !== recruiterId.toString()
+    ) {
       return res.status(403).json({
         success: false,
-        message: "You do not have access to this job's applications",
+        message: "You are not authorized to view applications for this job",
       });
     }
 
-    const {
-      page = 1,
-      limit = 20,
-      status,
-      search,
-      sortBy = "appliedAt",
-      sortOrder = "desc",
-    } = req.query;
-
-    const pageNum = Math.max(1, parseInt(page));
-    const limitNum = Math.max(1, Math.min(100, parseInt(limit)));
-    const skip = (pageNum - 1) * limitNum;
-
-    const filter = { jobId: new mongoose.Types.ObjectId(jobId) };
-    if (status && status !== "all") filter.status = status;
-    if (search && search.trim()) {
-      const s = search.trim();
-      filter.$or = [
-        { candidateName: { $regex: s, $options: "i" } },
-        { candidateEmail: { $regex: s, $options: "i" } },
-        { candidatePhone: { $regex: s, $options: "i" } },
-      ];
+    const candidateJobIds = [jobId];
+    if (mongoose.Types.ObjectId.isValid(jobId)) {
+      candidateJobIds.push(new mongoose.Types.ObjectId(jobId));
     }
 
-    const sortObj = { [sortBy]: sortOrder === "asc" ? 1 : -1 };
+    const appQuery = {
+      jobId: { $in: candidateJobIds },
+    };
 
-    const [applications, total] = await Promise.all([
-      Application.find(filter)
-        .sort(sortObj)
-        .skip(skip)
-        .limit(limitNum)
-        .lean(),
-      Application.countDocuments(filter),
-    ]);
+    if (req.query.status && req.query.status !== "all") {
+      appQuery.status = req.query.status;
+    }
 
-    const statusCounts = await Application.aggregate([
-      { $match: { jobId: new mongoose.Types.ObjectId(jobId) } },
-      { $group: { _id: "$status", count: { $sum: 1 } } },
-    ]);
+    const applications = await Application.find(appQuery)
+      .sort({ appliedAt: -1, createdAt: -1 })
+      .lean();
 
-    const countsMap = {};
-    statusCounts.forEach((sc) => {
-      countsMap[sc._id] = sc.count;
-    });
-
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
+      count: applications.length,
       data: applications,
-      jobTitle: job.title,
-      companyName: job.companyName,
-      pagination: {
-        page: pageNum,
-        limit: limitNum,
-        total,
-        pages: Math.ceil(total / limitNum) || 1,
+      job: {
+        _id: job._id,
+        title: job.title,
+        companyName: job.companyName,
       },
-      counts: countsMap,
     });
   } catch (error) {
-    console.error("Get Recruiter Job Applications Error:", error.message);
-    res.status(500).json({
+    console.error("Hierarchy getRecruiterJobApplications error:", error);
+    return res.status(500).json({
       success: false,
-      message: "Server error while fetching applications",
+      message: "Failed to fetch job applications",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
-};
-
-module.exports = {
-  getCompaniesWithStats,
-  getJobsByCompany,
-  getRecruiterJobsWithStats,
-  getRecruiterJobApplications,
 };
