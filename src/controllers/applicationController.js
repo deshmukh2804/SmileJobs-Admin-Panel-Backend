@@ -6,6 +6,61 @@ const User = require("../models/User");
 const mongoose = require("mongoose");
 
 // ═══════════════════════════════════════════════════════════════
+// TENANT ISOLATION HELPERS (MAPPED TO MULTI-DB PATTERN)
+// Ensures recruiters cannot read/write other company applications.
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Fetch all job ObjectIds owned by the recruiter from the Job_db database.
+ */
+const getRecruiterJobIds = async (recruiterId) => {
+  if (!recruiterId) return [];
+  const jobs = await Job.find({ recruiterId }).select("_id").lean();
+  return jobs.map((j) => j._id);
+};
+
+/**
+ * Apply dynamic scope to query filters depending on the authenticated user's role.
+ * Admins retain global access; recruiters are scoped strictly to their owned jobs.
+ * Supports intersection with a requested job identifier.
+ */
+const applyRecruiterScope = async (filter, authUser, requestedJobId = null) => {
+  if (!authUser) {
+    throw new Error("Authentication verification failed: User payload missing");
+  }
+
+  // Admin access bypass
+  if (authUser.role !== "recruiter") {
+    if (requestedJobId && mongoose.Types.ObjectId.isValid(requestedJobId)) {
+      filter.jobId = new mongoose.Types.ObjectId(requestedJobId);
+    }
+    return true;
+  }
+
+  // Recruiter restriction path
+  const ownedJobIds = await getRecruiterJobIds(authUser.id);
+  const ownedJobIdsStr = ownedJobIds.map((id) => id.toString());
+
+  if (requestedJobId) {
+    const requestedJobIdStr = requestedJobId.toString();
+    if (!ownedJobIdsStr.includes(requestedJobIdStr)) {
+      return false; // Unauthorized access attempt detected
+    }
+    filter.jobId = new mongoose.Types.ObjectId(requestedJobIdStr);
+  } else if (filter.jobId) {
+    const existingJobIdStr = filter.jobId.toString();
+    if (!ownedJobIdsStr.includes(existingJobIdStr)) {
+      return false; // Unauthorized access attempt detected
+    }
+    filter.jobId = new mongoose.Types.ObjectId(existingJobIdStr);
+  } else {
+    filter.jobId = { $in: ownedJobIds };
+  }
+
+  return true;
+};
+
+// ═══════════════════════════════════════════════════════════════
 // RESUME PROXY URL BUILDER
 // Transforms raw Cloudinary resume URLs into proper proxy URLs
 // that stream validated PDF buffers with correct headers.
@@ -152,7 +207,6 @@ const enrichApplications = async (applications) => {
     const currentStatus = appObj.status || "Applied";
     const allowedNextStatuses = STATUS_WORKFLOW[currentStatus] || [];
 
-    // ═══════════════════════════════════════════════════════════
     // 🔧 RESUME URL TRANSFORMATION
     // Replace raw Cloudinary URL with the mobile app backend's
     // proxy endpoint that streams a validated PDF buffer.
@@ -162,11 +216,8 @@ const enrichApplications = async (applications) => {
 
     return {
       ...appObj,
-      // Replace resume URL with proxy URL (fixes "corrupted file" issue)
       resumeUrl: proxyResumeUrl || originalResumeUrl,
-      // Preserve original for debugging/fallback
       resumeOriginalUrl: originalResumeUrl,
-      // Recruiter (job poster) details
       recruiter: recruiterData
         ? {
             id: recruiterData._id,
@@ -180,7 +231,6 @@ const enrichApplications = async (applications) => {
             verified: recruiterData.verified || false,
           }
         : null,
-      // Full job details
       jobDetails: jobData
         ? {
             id: jobData._id,
@@ -194,7 +244,6 @@ const enrichApplications = async (applications) => {
             contactPerson: jobData.contactPerson,
           }
         : null,
-      // Candidate user account info
       candidateAccount: userData
         ? {
             id: userData._id,
@@ -205,7 +254,6 @@ const enrichApplications = async (applications) => {
             memberSince: userData.createdAt,
           }
         : null,
-      // Workflow metadata
       workflow: {
         currentStatus,
         allowedNextStatuses,
@@ -220,10 +268,11 @@ const enrichApplications = async (applications) => {
   });
 };
 
-// @desc    Get all applications (with filters & pagination)
+// @desc    Get all applications (with filters, pagination & tenant isolation)
 // @route   GET /api/v1/applications
 const getApplications = async (req, res) => {
   try {
+    const authUser = req.authUser;
     const {
       search,
       status,
@@ -241,6 +290,32 @@ const getApplications = async (req, res) => {
 
     const filter = {};
 
+    // 🛡️ Apply Secure Recruiter Scoping (Tenant Isolation)
+    const isAuthorized = await applyRecruiterScope(filter, authUser, jobId);
+    if (!isAuthorized) {
+      return res.status(200).json({
+        success: true,
+        data: [],
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total: 0,
+          pages: 1,
+        },
+        counts: {
+          applied: 0,
+          viewed: 0,
+          shortlisted: 0,
+          interview: 0,
+          offered: 0,
+          hired: 0,
+          rejected: 0,
+          withdrawn: 0,
+          total: 0,
+        },
+      });
+    }
+
     if (search) {
       filter.$or = [
         { candidateName: { $regex: search, $options: "i" } },
@@ -253,9 +328,6 @@ const getApplications = async (req, res) => {
 
     if (status && status !== "all") filter.status = status;
     if (category && category !== "all") filter.category = category;
-    if (jobId && mongoose.Types.ObjectId.isValid(jobId)) {
-      filter.jobId = new mongoose.Types.ObjectId(jobId);
-    }
     if (userId && mongoose.Types.ObjectId.isValid(userId)) {
       filter.userId = new mongoose.Types.ObjectId(userId);
     }
@@ -275,28 +347,38 @@ const getApplications = async (req, res) => {
       Application.countDocuments(filter),
     ]);
 
-    // Enrich each application with recruiter + user + workflow metadata
+    // Enrich matched applications with nested entities
     const enriched = await enrichApplications(applications);
 
-    const [
-      appliedCount,
-      viewedCount,
-      shortlistedCount,
-      interviewCount,
-      offeredCount,
-      hiredCount,
-      rejectedCount,
-      withdrawnCount,
-    ] = await Promise.all([
-      Application.countDocuments({ status: "Applied" }),
-      Application.countDocuments({ status: "Viewed" }),
-      Application.countDocuments({ status: "Shortlisted" }),
-      Application.countDocuments({ status: "Interview" }),
-      Application.countDocuments({ status: "Offered" }),
-      Application.countDocuments({ status: "Hired" }),
-      Application.countDocuments({ status: "Rejected" }),
-      Application.countDocuments({ status: "Withdrawn" }),
+    // 📈 500,000+ RECORD PERFORMANCE OPTIMIZATION
+    // Replaced 8 separate global countDocuments calls with a single scoped group aggregation.
+    // This dynamically tracks totals respecting current query, filters, and recruiter tenancy limits.
+    const counts = {
+      applied: 0,
+      viewed: 0,
+      shortlisted: 0,
+      interview: 0,
+      offered: 0,
+      hired: 0,
+      rejected: 0,
+      withdrawn: 0,
+      total: 0,
+    };
+
+    const statusCountsAgg = await Application.aggregate([
+      { $match: filter },
+      { $group: { _id: "$status", count: { $sum: 1 } } },
     ]);
+
+    statusCountsAgg.forEach((sc) => {
+      if (sc._id) {
+        const key = sc._id.toLowerCase();
+        if (key in counts) {
+          counts[key] = sc.count;
+          counts.total += sc.count;
+        }
+      }
+    });
 
     res.status(200).json({
       success: true,
@@ -305,27 +387,9 @@ const getApplications = async (req, res) => {
         page: parseInt(page),
         limit: parseInt(limit),
         total,
-        pages: Math.ceil(total / parseInt(limit)),
+        pages: Math.ceil(total / parseInt(limit)) || 1,
       },
-      counts: {
-        applied: appliedCount,
-        viewed: viewedCount,
-        shortlisted: shortlistedCount,
-        interview: interviewCount,
-        offered: offeredCount,
-        hired: hiredCount,
-        rejected: rejectedCount,
-        withdrawn: withdrawnCount,
-        total:
-          appliedCount +
-          viewedCount +
-          shortlistedCount +
-          interviewCount +
-          offeredCount +
-          hiredCount +
-          rejectedCount +
-          withdrawnCount,
-      },
+      counts,
     });
   } catch (error) {
     console.error("Get Applications Error:", error.message);
@@ -336,16 +400,29 @@ const getApplications = async (req, res) => {
   }
 };
 
-// @desc    Get single application by ID
+// @desc    Get single application by ID (with security scope validation)
 // @route   GET /api/v1/applications/:id
 const getApplicationById = async (req, res) => {
   try {
+    const authUser = req.authUser;
     const application = await Application.findById(req.params.id);
     if (!application) {
       return res.status(404).json({
         success: false,
         message: "Application not found",
       });
+    }
+
+    // 🛡️ Tenant isolation authorization check
+    if (authUser.role === "recruiter") {
+      const ownedJobIds = await getRecruiterJobIds(authUser.id);
+      const ownedJobIdsStr = ownedJobIds.map((id) => id.toString());
+      if (!ownedJobIdsStr.includes(application.jobId.toString())) {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied. You are not authorized to view this application's parent job details.",
+        });
+      }
     }
 
     const enriched = await enrichApplications([application]);
@@ -363,10 +440,11 @@ const getApplicationById = async (req, res) => {
   }
 };
 
-// @desc    Update application status (with sequential validation)
+// @desc    Update application status (with sequential validation & security checks)
 // @route   PATCH /api/v1/applications/:id/status
 const updateApplicationStatus = async (req, res) => {
   try {
+    const authUser = req.authUser;
     const { status, hrNotes } = req.body;
 
     if (!status) {
@@ -391,6 +469,18 @@ const updateApplicationStatus = async (req, res) => {
         success: false,
         message: "Application not found",
       });
+    }
+
+    // 🛡️ Tenant isolation authorization check
+    if (authUser.role === "recruiter") {
+      const ownedJobIds = await getRecruiterJobIds(authUser.id);
+      const ownedJobIdsStr = ownedJobIds.map((id) => id.toString());
+      if (!ownedJobIdsStr.includes(application.jobId.toString())) {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied. You do not own the parent job posting for this application.",
+        });
+      }
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -428,7 +518,6 @@ const updateApplicationStatus = async (req, res) => {
 
     await application.save();
 
-    // Return enriched version
     const enriched = await enrichApplications([application]);
 
     res.status(200).json({
@@ -445,17 +534,32 @@ const updateApplicationStatus = async (req, res) => {
   }
 };
 
-// @desc    Delete application
+// @desc    Delete application (with secure tenancy checks)
 // @route   DELETE /api/v1/applications/:id
 const deleteApplication = async (req, res) => {
   try {
-    const application = await Application.findByIdAndDelete(req.params.id);
+    const authUser = req.authUser;
+    const application = await Application.findById(req.params.id);
     if (!application) {
       return res.status(404).json({
         success: false,
         message: "Application not found",
       });
     }
+
+    // 🛡️ Tenant isolation authorization check
+    if (authUser.role === "recruiter") {
+      const ownedJobIds = await getRecruiterJobIds(authUser.id);
+      const ownedJobIdsStr = ownedJobIds.map((id) => id.toString());
+      if (!ownedJobIdsStr.includes(application.jobId.toString())) {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied. You do not own the parent job posting for this application.",
+        });
+      }
+    }
+
+    await Application.findByIdAndDelete(req.params.id);
 
     res.status(200).json({
       success: true,
@@ -470,12 +574,34 @@ const deleteApplication = async (req, res) => {
   }
 };
 
-// @desc    Get applications for a job
+// @desc    Get applications for a job (scoping validated)
 // @route   GET /api/v1/applications/job/:jobId
 const getApplicationsByJob = async (req, res) => {
   try {
+    const authUser = req.authUser;
+    const { jobId } = req.params;
     const { page = 1, limit = 50, status } = req.query;
-    const filter = { jobId: new mongoose.Types.ObjectId(req.params.jobId) };
+
+    if (!mongoose.Types.ObjectId.isValid(jobId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid job ID",
+      });
+    }
+
+    // 🛡️ Tenant isolation authorization check
+    if (authUser.role === "recruiter") {
+      const ownedJobIds = await getRecruiterJobIds(authUser.id);
+      const ownedJobIdsStr = ownedJobIds.map((id) => id.toString());
+      if (!ownedJobIdsStr.includes(jobId.toString())) {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied. You do not own this job.",
+        });
+      }
+    }
+
+    const filter = { jobId: new mongoose.Types.ObjectId(jobId) };
     if (status && status !== "all") filter.status = status;
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -497,7 +623,7 @@ const getApplicationsByJob = async (req, res) => {
         page: parseInt(page),
         limit: parseInt(limit),
         total,
-        pages: Math.ceil(total / parseInt(limit)),
+        pages: Math.ceil(total / parseInt(limit)) || 1,
       },
     });
   } catch (error) {
@@ -509,12 +635,38 @@ const getApplicationsByJob = async (req, res) => {
   }
 };
 
-// @desc    Get applications for a user
+// @desc    Get applications for a user (scoping validated)
 // @route   GET /api/v1/applications/user/:userId
 const getApplicationsByUser = async (req, res) => {
   try {
+    const authUser = req.authUser;
+    const { userId } = req.params;
     const { page = 1, limit = 50, status } = req.query;
-    const filter = { userId: new mongoose.Types.ObjectId(req.params.userId) };
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid user ID",
+      });
+    }
+
+    const filter = { userId: new mongoose.Types.ObjectId(userId) };
+
+    // 🛡️ Filter scope verification for candidates viewed by recruiters
+    const isAuthorized = await applyRecruiterScope(filter, authUser);
+    if (!isAuthorized) {
+      return res.status(200).json({
+        success: true,
+        data: [],
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total: 0,
+          pages: 1,
+        },
+      });
+    }
+
     if (status && status !== "all") filter.status = status;
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -536,7 +688,7 @@ const getApplicationsByUser = async (req, res) => {
         page: parseInt(page),
         limit: parseInt(limit),
         total,
-        pages: Math.ceil(total / parseInt(limit)),
+        pages: Math.ceil(total / parseInt(limit)) || 1,
       },
     });
   } catch (error) {
@@ -548,10 +700,11 @@ const getApplicationsByUser = async (req, res) => {
   }
 };
 
-// @desc    Bulk update application statuses (with sequential validation)
+// @desc    Bulk update application statuses (validated for transitions & security ownership)
 // @route   PATCH /api/v1/applications/bulk-status
 const bulkUpdateStatus = async (req, res) => {
   try {
+    const authUser = req.authUser;
     const { ids, status } = req.body;
 
     if (!ids || !Array.isArray(ids) || ids.length === 0) {
@@ -576,8 +729,14 @@ const bulkUpdateStatus = async (req, res) => {
       });
     }
 
-    // Fetch each & validate transition
-    const applications = await Application.find({ _id: { $in: ids } });
+    // 🛡️ Tenant isolation: Only select applications mapped to recruiter's jobs
+    const query = { _id: { $in: ids } };
+    if (authUser.role === "recruiter") {
+      const ownedJobIds = await getRecruiterJobIds(authUser.id);
+      query.jobId = { $in: ownedJobIds };
+    }
+
+    const applications = await Application.find(query);
 
     const eligibleIds = [];
     const skippedIds = [];
@@ -593,6 +752,18 @@ const bulkUpdateStatus = async (req, res) => {
         });
       }
     }
+
+    // Capture unauthorized or invalid IDs supplied in the batch
+    const retrievedIdsStr = applications.map((app) => app._id.toString());
+    ids.forEach((inputId) => {
+      if (!retrievedIdsStr.includes(inputId.toString())) {
+        skippedIds.push({
+          id: inputId,
+          candidate: "Unauthorized or missing application document reference",
+          currentStatus: "N/A",
+        });
+      }
+    });
 
     let modifiedCount = 0;
     if (eligibleIds.length > 0) {
@@ -616,7 +787,7 @@ const bulkUpdateStatus = async (req, res) => {
 
     res.status(200).json({
       success: true,
-      message: `${modifiedCount} application(s) updated to ${status}. ${skippedIds.length} skipped due to invalid workflow transition.`,
+      message: `${modifiedCount} application(s) updated to ${status}. ${skippedIds.length} skipped due to invalid workflow transition or lack of authorization.`,
       data: {
         modifiedCount,
         skipped: skippedIds,
