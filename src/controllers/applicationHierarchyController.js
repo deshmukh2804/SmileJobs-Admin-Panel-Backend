@@ -11,7 +11,7 @@ try {
 }
 
 /**
- * Helper: Normalizes application status counts into standardized buckets
+ * Helper: Creates empty status counts bucket
  */
 function createEmptyStats() {
   return {
@@ -26,6 +26,9 @@ function createEmptyStats() {
   };
 }
 
+/**
+ * Helper: Maps application status to bucket
+ */
 function accumulateStatus(statsObj, status, count = 1) {
   const s = String(status || "").trim().toLowerCase();
   statsObj.total += count;
@@ -60,7 +63,7 @@ exports.getCompaniesWithStats = async (req, res) => {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
     const skip = (page - 1) * limit;
 
-    const { search, status, verified, industry } = req.query;
+    const { search, verified, industry } = req.query;
 
     // 1. Build Recruiter search/filter query
     const recruiterQuery = {};
@@ -93,7 +96,7 @@ exports.getCompaniesWithStats = async (req, res) => {
       recruiterQuery["companyProfile.industry"] = new RegExp(industry.trim(), "i");
     }
 
-    // 2. Fetch Recruiters matching query
+    // 2. Fetch Recruiters
     const [totalRecruiters, recruiters] = await Promise.all([
       Recruiter.countDocuments(recruiterQuery),
       Recruiter.find(recruiterQuery)
@@ -119,87 +122,75 @@ exports.getCompaniesWithStats = async (req, res) => {
       });
     }
 
-    // 3. Collect recruiter IDs (both ObjectId and String formats for bulletproof matching)
-    const recruiterIds = [];
-    const recruiterIdStrings = [];
-    recruiters.forEach((r) => {
-      recruiterIds.push(r._id);
-      recruiterIdStrings.push(r._id.toString());
-    });
-
-    // 4. Fetch all jobs belonging to these recruiters from Job_db
-    const allJobs = await Job.find({
-      $or: [
-        { recruiterId: { $in: recruiterIds } },
-        { recruiterId: { $in: recruiterIdStrings } },
-      ],
-    })
-      .select("_id recruiterId title status isActive companyName")
+    // 3. Fetch all jobs from Job_db to match recruiters by ID, userId, or companyName
+    const allJobs = await Job.find({})
+      .select("_id recruiterId userId postedBy createdBy title status isActive companyName company companyProfile")
       .lean();
 
-    // Group jobs by recruiter ID
-    const jobsByRecruiter = new Map();
-    const allJobIds = [];
+    // 4. Fetch and aggregate all application stats by Job ID from application_db
+    const appAggregation = await Application.aggregate([
+      {
+        $project: {
+          status: "$status",
+          targetJobId: {
+            $toString: { $ifNull: ["$jobId", "$job"] },
+          },
+        },
+      },
+      {
+        $group: {
+          _id: {
+            jobId: "$targetJobId",
+            status: "$status",
+          },
+          count: { $sum: 1 },
+        },
+      },
+    ]);
 
-    allJobs.forEach((job) => {
-      const recIdStr = job.recruiterId ? job.recruiterId.toString() : null;
-      if (recIdStr) {
-        if (!jobsByRecruiter.has(recIdStr)) {
-          jobsByRecruiter.set(recIdStr, []);
-        }
-        jobsByRecruiter.get(recIdStr).push(job);
+    const appStatsByJobId = new Map();
+    appAggregation.forEach((row) => {
+      const jIdStr = row._id.jobId;
+      if (!jIdStr) return;
+
+      if (!appStatsByJobId.has(jIdStr)) {
+        appStatsByJobId.set(jIdStr, createEmptyStats());
       }
-      allJobIds.push(job._id);
+      accumulateStatus(appStatsByJobId.get(jIdStr), row._id.status, row.count);
     });
 
-    // 5. Aggregate Application stats for all these job IDs from application_db
-    const appStatsByJobId = new Map();
-
-    if (allJobIds.length > 0) {
-      const jobObjectIds = allJobIds
-        .map((id) => {
-          try {
-            return mongoose.Types.ObjectId.isValid(id)
-              ? new mongoose.Types.ObjectId(id)
-              : id;
-          } catch (e) {
-            return id;
-          }
-        })
-        .filter(Boolean);
-
-      const appAggregation = await Application.aggregate([
-        {
-          $match: {
-            jobId: { $in: jobObjectIds },
-          },
-        },
-        {
-          $group: {
-            _id: {
-              jobId: "$jobId",
-              status: "$status",
-            },
-            count: { $sum: 1 },
-          },
-        },
-      ]);
-
-      appAggregation.forEach((row) => {
-        const jIdStr = row._id.jobId ? row._id.jobId.toString() : "";
-        if (!jIdStr) return;
-
-        if (!appStatsByJobId.has(jIdStr)) {
-          appStatsByJobId.set(jIdStr, createEmptyStats());
-        }
-        accumulateStatus(appStatsByJobId.get(jIdStr), row._id.status, row.count);
-      });
-    }
-
-    // 6. Assemble company records with live aggregated stats
+    // 5. Assemble company records with matched jobs & application stats
     const companyList = recruiters.map((recruiter) => {
-      const recIdStr = recruiter._id.toString();
-      const recruiterJobs = jobsByRecruiter.get(recIdStr) || [];
+      const recIdStr = recruiter._id ? recruiter._id.toString() : "";
+      const profile = recruiter.companyProfile || {};
+      const companyName =
+        profile.name ||
+        recruiter.companyName ||
+        recruiter.name ||
+        "Unnamed Company";
+
+      const compNameLower = companyName.trim().toLowerCase();
+
+      // Find all jobs belonging to this recruiter
+      const recruiterJobs = allJobs.filter((job) => {
+        const jRecId = job.recruiterId ? job.recruiterId.toString() : "";
+        const jUserId = job.userId ? job.userId.toString() : "";
+        const jPostedBy = job.postedBy ? job.postedBy.toString() : "";
+        const jCreatedBy = job.createdBy ? job.createdBy.toString() : "";
+
+        if (
+          (recIdStr && (jRecId === recIdStr || jUserId === recIdStr || jPostedBy === recIdStr || jCreatedBy === recIdStr))
+        ) {
+          return true;
+        }
+
+        const jCompName = String(job.companyName || job.company || "").trim().toLowerCase();
+        if (compNameLower && jCompName && compNameLower === jCompName) {
+          return true;
+        }
+
+        return false;
+      });
 
       // Calculate total & active jobs
       const totalJobs = recruiterJobs.length;
@@ -214,7 +205,7 @@ exports.getCompaniesWithStats = async (req, res) => {
       // Sum application stats across all recruiter's jobs
       const compStats = createEmptyStats();
       recruiterJobs.forEach((job) => {
-        const jIdStr = job._id.toString();
+        const jIdStr = job._id ? job._id.toString() : "";
         const jobStats = appStatsByJobId.get(jIdStr);
         if (jobStats) {
           compStats.total += jobStats.total;
@@ -228,18 +219,11 @@ exports.getCompaniesWithStats = async (req, res) => {
         }
       });
 
-      // Extract Company Name & Logo with multiple fallbacks
-      const profile = recruiter.companyProfile || {};
-      const companyName =
-        profile.name ||
-        recruiter.companyName ||
-        recruiter.name ||
-        "Unnamed Company";
-
+      // Extract Company Logo
       const logo = {
         url:
           profile.logo?.url ||
-          profile.logo ||
+          (typeof profile.logo === "string" ? profile.logo : "") ||
           recruiter.avatar?.url ||
           "",
         publicId: profile.logo?.publicId || recruiter.avatar?.public_id || "",
@@ -257,7 +241,8 @@ exports.getCompaniesWithStats = async (req, res) => {
       );
 
       return {
-        _id: recruiter._id,
+        _id: recIdStr,
+        id: recIdStr,
         name: companyName,
         companyName: companyName,
         recruiterName: recruiter.name || "",
@@ -272,7 +257,7 @@ exports.getCompaniesWithStats = async (req, res) => {
         verified: isVerified,
         isActive: recruiter.isActive !== false,
         recruiterId: {
-          _id: recruiter._id,
+          _id: recIdStr,
           name: recruiter.name || "",
           email: recruiter.email || "",
         },
@@ -323,14 +308,14 @@ exports.getJobsByCompany = async (req, res) => {
 
     const { search, status, jobType, workMode } = req.query;
 
-    if (!companyId) {
+    if (!companyId || companyId === "undefined" || companyId === "null") {
       return res.status(400).json({
         success: false,
-        message: "companyId parameter is required",
+        message: "A valid companyId parameter is required",
       });
     }
 
-    // 1. Fetch Recruiter or Company info for header display
+    // 1. Fetch Recruiter or Company info
     let recruiter = null;
     try {
       if (mongoose.Types.ObjectId.isValid(companyId)) {
@@ -340,26 +325,34 @@ exports.getJobsByCompany = async (req, res) => {
       recruiter = null;
     }
 
-    // 2. Build Job search criteria
-    const candidateIds = [companyId];
+    // 2. Build Job query matching ID or company name
+    const matchConditions = [];
+
     if (mongoose.Types.ObjectId.isValid(companyId)) {
-      candidateIds.push(new mongoose.Types.ObjectId(companyId));
+      const objId = new mongoose.Types.ObjectId(companyId);
+      matchConditions.push({ recruiterId: objId });
+      matchConditions.push({ userId: objId });
+      matchConditions.push({ postedBy: objId });
+      matchConditions.push({ createdBy: objId });
+      matchConditions.push({ companyId: objId });
     }
 
-    const jobQuery = {
-      $or: [
-        { recruiterId: { $in: candidateIds } },
-        { companyId: { $in: candidateIds } },
-      ],
-    };
+    matchConditions.push({ recruiterId: companyId });
+    matchConditions.push({ userId: companyId });
+    matchConditions.push({ postedBy: companyId });
+    matchConditions.push({ createdBy: companyId });
+    matchConditions.push({ companyId: companyId });
 
-    // If recruiter has a known companyName and no recruiterId matches, fallback to companyName
-    if (recruiter && (recruiter.companyName || recruiter.companyProfile?.name)) {
+    if (recruiter) {
       const cName = recruiter.companyProfile?.name || recruiter.companyName;
-      jobQuery.$or.push({
-        companyName: new RegExp(`^${cName.trim()}$`, "i"),
-      });
+      if (cName && cName.trim()) {
+        const cRegex = new RegExp(`^${cName.trim()}$`, "i");
+        matchConditions.push({ companyName: cRegex });
+        matchConditions.push({ company: cRegex });
+      }
     }
+
+    const jobQuery = { $or: matchConditions };
 
     if (search && search.trim()) {
       const sRegex = new RegExp(search.trim(), "i");
@@ -388,7 +381,7 @@ exports.getJobsByCompany = async (req, res) => {
       jobQuery.workMode = workMode;
     }
 
-    // 3. Fetch Jobs with pagination
+    // 3. Fetch Jobs
     const [totalJobs, jobs] = await Promise.all([
       Job.countDocuments(jobQuery),
       Job.find(jobQuery)
@@ -413,7 +406,8 @@ exports.getJobsByCompany = async (req, res) => {
         data: [],
         company: recruiter
           ? {
-              _id: recruiter._id,
+              _id: recruiter._id.toString(),
+              id: recruiter._id.toString(),
               name:
                 recruiter.companyProfile?.name ||
                 recruiter.companyName ||
@@ -426,16 +420,16 @@ exports.getJobsByCompany = async (req, res) => {
       });
     }
 
-    // 4. Aggregate Application Stats for these jobs
-    const jobIds = jobs.map((j) => j._id);
+    // 4. Aggregate Application Stats for these specific jobs
+    const jobIds = jobs.map((j) => (j._id ? j._id.toString() : "")).filter(Boolean);
     const jobObjectIds = jobIds
       .map((id) => {
         try {
           return mongoose.Types.ObjectId.isValid(id)
             ? new mongoose.Types.ObjectId(id)
-            : id;
+            : null;
         } catch (e) {
-          return id;
+          return null;
         }
       })
       .filter(Boolean);
@@ -443,13 +437,24 @@ exports.getJobsByCompany = async (req, res) => {
     const appAggregation = await Application.aggregate([
       {
         $match: {
-          jobId: { $in: jobObjectIds },
+          $or: [
+            { jobId: { $in: [...jobObjectIds, ...jobIds] } },
+            { job: { $in: [...jobObjectIds, ...jobIds] } },
+          ],
+        },
+      },
+      {
+        $project: {
+          status: "$status",
+          targetJobId: {
+            $toString: { $ifNull: ["$jobId", "$job"] },
+          },
         },
       },
       {
         $group: {
           _id: {
-            jobId: "$jobId",
+            jobId: "$targetJobId",
             status: "$status",
           },
           count: { $sum: 1 },
@@ -459,7 +464,7 @@ exports.getJobsByCompany = async (req, res) => {
 
     const statsMap = new Map();
     appAggregation.forEach((row) => {
-      const jIdStr = row._id.jobId ? row._id.jobId.toString() : "";
+      const jIdStr = row._id.jobId;
       if (!jIdStr) return;
 
       if (!statsMap.has(jIdStr)) {
@@ -470,11 +475,12 @@ exports.getJobsByCompany = async (req, res) => {
 
     // 5. Combine jobs with application stats
     const jobsWithStats = jobs.map((job) => {
-      const jIdStr = job._id.toString();
+      const jIdStr = job._id ? job._id.toString() : "";
       const stats = statsMap.get(jIdStr) || createEmptyStats();
 
       return {
-        _id: job._id,
+        _id: jIdStr,
+        id: jIdStr,
         title: job.title || "Untitled Job",
         companyName:
           job.companyName ||
@@ -517,7 +523,8 @@ exports.getJobsByCompany = async (req, res) => {
       data: jobsWithStats,
       company: recruiter
         ? {
-            _id: recruiter._id,
+            _id: recruiter._id.toString(),
+            id: recruiter._id.toString(),
             name:
               recruiter.companyProfile?.name ||
               recruiter.companyName ||
@@ -533,6 +540,86 @@ exports.getJobsByCompany = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to fetch company jobs",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  }
+};
+
+/**
+ * @desc    Get all applications for a specific job (Admin view)
+ * @route   GET /api/v1/applications/hierarchy/jobs/:jobId/applications
+ * @access  Private (Admin / Super Admin)
+ */
+exports.getJobApplicationsForAdmin = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const { status, search } = req.query;
+
+    if (!jobId || jobId === "undefined" || jobId === "null") {
+      return res.status(400).json({
+        success: false,
+        message: "A valid jobId parameter is required",
+      });
+    }
+
+    const candidateJobIds = [jobId];
+    if (mongoose.Types.ObjectId.isValid(jobId)) {
+      candidateJobIds.push(new mongoose.Types.ObjectId(jobId));
+    }
+
+    const appQuery = {
+      $or: [
+        { jobId: { $in: candidateJobIds } },
+        { job: { $in: candidateJobIds } },
+      ],
+    };
+
+    if (status && status !== "all") {
+      appQuery.status = status;
+    }
+
+    if (search && search.trim()) {
+      const sRegex = new RegExp(search.trim(), "i");
+      appQuery.$and = [
+        ...(appQuery.$and || []),
+        {
+          $or: [
+            { candidateName: sRegex },
+            { candidateEmail: sRegex },
+            { candidatePhone: sRegex },
+            { candidateSkills: sRegex },
+          ],
+        },
+      ];
+    }
+
+    const [applications, job] = await Promise.all([
+      Application.find(appQuery).sort({ appliedAt: -1, createdAt: -1 }).lean(),
+      Job.findById(jobId).lean().catch(() => null),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      count: applications.length,
+      data: applications.map((app) => ({
+        ...app,
+        _id: app._id ? app._id.toString() : "",
+        id: app._id ? app._id.toString() : "",
+      })),
+      job: job
+        ? {
+            _id: job._id.toString(),
+            id: job._id.toString(),
+            title: job.title,
+            companyName: job.companyName,
+          }
+        : null,
+    });
+  } catch (error) {
+    console.error("Hierarchy getJobApplicationsForAdmin error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch applications for job",
       error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
@@ -557,13 +644,17 @@ exports.getRecruiterJobsWithStats = async (req, res) => {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
     const skip = (page - 1) * limit;
 
-    const candidateIds = [recruiterId];
+    const candidateIds = [recruiterId.toString()];
     if (mongoose.Types.ObjectId.isValid(recruiterId)) {
       candidateIds.push(new mongoose.Types.ObjectId(recruiterId));
     }
 
     const jobQuery = {
-      recruiterId: { $in: candidateIds },
+      $or: [
+        { recruiterId: { $in: candidateIds } },
+        { userId: { $in: candidateIds } },
+        { postedBy: { $in: candidateIds } },
+      ],
     };
 
     if (req.query.search && req.query.search.trim()) {
@@ -584,24 +675,39 @@ exports.getRecruiterJobsWithStats = async (req, res) => {
         .lean(),
     ]);
 
-    const jobIds = jobs.map((j) => j._id);
+    const jobIds = jobs.map((j) => (j._id ? j._id.toString() : "")).filter(Boolean);
     const jobObjectIds = jobIds
       .map((id) => {
         try {
           return mongoose.Types.ObjectId.isValid(id)
             ? new mongoose.Types.ObjectId(id)
-            : id;
+            : null;
         } catch (e) {
-          return id;
+          return null;
         }
       })
       .filter(Boolean);
 
     const appAggregation = await Application.aggregate([
-      { $match: { jobId: { $in: jobObjectIds } } },
+      {
+        $match: {
+          $or: [
+            { jobId: { $in: [...jobObjectIds, ...jobIds] } },
+            { job: { $in: [...jobObjectIds, ...jobIds] } },
+          ],
+        },
+      },
+      {
+        $project: {
+          status: "$status",
+          targetJobId: {
+            $toString: { $ifNull: ["$jobId", "$job"] },
+          },
+        },
+      },
       {
         $group: {
-          _id: { jobId: "$jobId", status: "$status" },
+          _id: { jobId: "$targetJobId", status: "$status" },
           count: { $sum: 1 },
         },
       },
@@ -609,17 +715,19 @@ exports.getRecruiterJobsWithStats = async (req, res) => {
 
     const statsMap = new Map();
     appAggregation.forEach((row) => {
-      const jIdStr = row._id.jobId ? row._id.jobId.toString() : "";
+      const jIdStr = row._id.jobId;
       if (!jIdStr) return;
       if (!statsMap.has(jIdStr)) statsMap.set(jIdStr, createEmptyStats());
       accumulateStatus(statsMap.get(jIdStr), row._id.status, row.count);
     });
 
     const jobsWithStats = jobs.map((job) => {
-      const jIdStr = job._id.toString();
+      const jIdStr = job._id ? job._id.toString() : "";
       const stats = statsMap.get(jIdStr) || createEmptyStats();
       return {
         ...job,
+        _id: jIdStr,
+        id: jIdStr,
         applicantsCount: stats.total,
         applicationStats: stats,
       };
@@ -660,6 +768,13 @@ exports.getRecruiterJobApplications = async (req, res) => {
     const recruiterId = req.user?._id;
     const { jobId } = req.params;
 
+    if (!jobId || jobId === "undefined" || jobId === "null") {
+      return res.status(400).json({
+        success: false,
+        message: "A valid jobId parameter is required",
+      });
+    }
+
     const job = await Job.findById(jobId).lean();
     if (!job) {
       return res.status(404).json({
@@ -670,7 +785,9 @@ exports.getRecruiterJobApplications = async (req, res) => {
 
     if (
       job.recruiterId &&
-      job.recruiterId.toString() !== recruiterId.toString()
+      job.recruiterId.toString() !== recruiterId.toString() &&
+      job.userId &&
+      job.userId.toString() !== recruiterId.toString()
     ) {
       return res.status(403).json({
         success: false,
@@ -678,13 +795,16 @@ exports.getRecruiterJobApplications = async (req, res) => {
       });
     }
 
-    const candidateJobIds = [jobId];
+    const candidateJobIds = [jobId.toString()];
     if (mongoose.Types.ObjectId.isValid(jobId)) {
       candidateJobIds.push(new mongoose.Types.ObjectId(jobId));
     }
 
     const appQuery = {
-      jobId: { $in: candidateJobIds },
+      $or: [
+        { jobId: { $in: candidateJobIds } },
+        { job: { $in: candidateJobIds } },
+      ],
     };
 
     if (req.query.status && req.query.status !== "all") {
@@ -698,9 +818,14 @@ exports.getRecruiterJobApplications = async (req, res) => {
     return res.status(200).json({
       success: true,
       count: applications.length,
-      data: applications,
+      data: applications.map((app) => ({
+        ...app,
+        _id: app._id ? app._id.toString() : "",
+        id: app._id ? app._id.toString() : "",
+      })),
       job: {
-        _id: job._id,
+        _id: job._id ? job._id.toString() : "",
+        id: job._id ? job._id.toString() : "",
         title: job.title,
         companyName: job.companyName,
       },
