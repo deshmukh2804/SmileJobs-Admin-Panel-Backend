@@ -79,32 +79,45 @@ const generateInitials = (name) => {
 };
 
 // ════════════════════════════════════════════════════════════════════════
-// ✅ SMART ADMIN DETECTION
+// ✅ STRICT ADMIN DETECTION (FIXED)
+// Rule: Only mark as ADMIN when there is EXPLICIT PROOF.
+// If no explicit admin markers → treat as RECRUITER (safer default).
 // ════════════════════════════════════════════════════════════════════════
+const ADMIN_EMAILS = ["smilejobs@gmail.com", "admin@smilejobs.com", "admin@careerflow.com"];
+const ADMIN_ROLES = ["admin", "super admin", "superadmin", "sub admin", "subadmin"];
+const ADMIN_NAMES = ["smile jobs", "smilejobs", "admin"];
+const RECRUITER_ROLES = ["recruiter", "employer", "hr"];
+
 const detectIsAdminPosted = (job) => {
   if (!job) return false;
   const j = typeof job.toObject === "function" ? job.toObject() : job;
 
-  if (String(j.postedBy || "").toLowerCase() === "admin") return true;
-  if (String(j.postedBy || "").toLowerCase() === "recruiter") return false;
+  // ─── STRONGEST SIGNAL: explicit postedBy string ───
+  const pb = String(j.postedBy || "").toLowerCase().trim();
+  if (pb === "admin") return true;
+  if (pb === "recruiter") return false;
 
+  // ─── EXPLICIT RECRUITER ROLE wins immediately ───
   const role = String(j.postedByRole || "").toLowerCase().trim();
-  if (role === "admin" || role === "super admin" || role === "superadmin" || role === "sub admin" || role === "subadmin") {
-    return true;
-  }
-  if (role === "recruiter" || role === "employer" || role === "hr") {
-    return false;
-  }
+  if (RECRUITER_ROLES.includes(role)) return false;
+  if (ADMIN_ROLES.includes(role)) return true;
 
-  const adminEmails = ["smilejobs@gmail.com", "admin@smilejobs.com", "admin@careerflow.com"];
+  // ─── EXPLICIT ADMIN EMAIL ───
   const email = String(j.postedByEmail || "").toLowerCase().trim();
-  if (email && adminEmails.includes(email)) return true;
+  if (email && ADMIN_EMAILS.includes(email)) return true;
 
+  // ─── EXPLICIT ADMIN NAME ───
   const name = String(j.postedByName || "").toLowerCase().trim();
-  if (name === "smile jobs" || name === "smilejobs" || name === "admin") return true;
+  if (name && ADMIN_NAMES.includes(name)) return true;
 
-  if (!j.recruiterId) return true;
+  // ─── RECRUITER SIGNALS (strong) ───
+  // If job has recruiterId OR recruiterEmail OR contactPerson → it's a recruiter job
+  if (j.recruiterId) return false;
+  if (j.recruiterEmail && String(j.recruiterEmail).trim()) return false;
+  if (j.contactPerson && (j.contactPerson.name || j.contactPerson.designation)) return false;
 
+  // ─── TRULY no markers at all → default to RECRUITER (safer) ───
+  // (Previously defaulted to admin which caused the bug)
   return false;
 };
 
@@ -145,7 +158,7 @@ const transformJobForFrontend = (job) => {
     } else if (j.contactPerson?.name) {
       resolvedPostedByName = j.contactPerson.name;
     } else {
-      resolvedPostedByName = "Unknown";
+      resolvedPostedByName = "Recruiter";
     }
   }
 
@@ -163,6 +176,24 @@ const transformJobForFrontend = (job) => {
   let resolvedPostedByRole = j.postedByRole || "";
   if (!resolvedPostedByRole) {
     resolvedPostedByRole = isAdminPosted ? "Super Admin" : "Recruiter";
+  }
+
+  // ✅ HARD GUARD — if role is recruiter-ish, FORCE recruiter output
+  const finalRoleCheck = String(resolvedPostedByRole).toLowerCase().trim();
+  const finalEmailCheck = String(resolvedPostedByEmail).toLowerCase().trim();
+  let finalIsAdmin = isAdminPosted;
+  let finalPostedBy = resolvedPostedBy;
+
+  if (RECRUITER_ROLES.includes(finalRoleCheck)) {
+    finalIsAdmin = false;
+    finalPostedBy = "recruiter";
+  } else if (ADMIN_EMAILS.includes(finalEmailCheck)) {
+    finalIsAdmin = true;
+    finalPostedBy = "admin";
+  } else if (j.recruiterId && !ADMIN_EMAILS.includes(finalEmailCheck) && !ADMIN_ROLES.includes(finalRoleCheck)) {
+    // recruiterId present and no admin markers → definitely recruiter
+    finalIsAdmin = false;
+    finalPostedBy = "recruiter";
   }
 
   return {
@@ -238,12 +269,12 @@ const transformJobForFrontend = (job) => {
     featured: Boolean(j.featured),
     isNew: true,
     isCompanyVerified: Boolean(j.isCompanyVerified),
-    postedBy: resolvedPostedBy,
+    postedBy: finalPostedBy,
     postedByUserId: j.postedByUserId || "",
     postedByName: resolvedPostedByName,
     postedByEmail: resolvedPostedByEmail,
     postedByRole: resolvedPostedByRole,
-    isAdminPosted,
+    isAdminPosted: finalIsAdmin,
     approvalStatus: j.approvalStatus || "approved",
     submittedForReviewAt: j.submittedForReviewAt || j.createdAt || new Date(),
     approvedAt: j.approvedAt || new Date(),
@@ -277,7 +308,14 @@ const buildRecruiterFilter = () => ({
     { postedBy: { $ne: "admin" } },
     { postedByRole: { $nin: ["Super Admin", "admin", "Admin", "Sub Admin", "superadmin", "subadmin"] } },
     { postedByEmail: { $nin: ["smilejobs@gmail.com", "admin@smilejobs.com", "admin@careerflow.com"] } },
-    { recruiterId: { $exists: true, $ne: null } }
+    {
+      $or: [
+        { recruiterId: { $exists: true, $ne: null } },
+        { recruiterEmail: { $exists: true, $ne: "" } },
+        { postedBy: "recruiter" },
+        { postedByRole: { $in: ["Recruiter", "recruiter", "Employer", "employer", "HR", "hr"] } }
+      ]
+    }
   ]
 });
 
@@ -287,7 +325,6 @@ const buildRecruiterFilter = () => ({
 const csvEscape = (val) => {
   if (val === null || val === undefined) return "";
   let s = String(val);
-  // Replace newlines with space
   s = s.replace(/\r?\n|\r/g, " ").trim();
   if (s.includes(",") || s.includes('"') || s.includes("\n")) {
     s = `"${s.replace(/"/g, '""')}"`;
@@ -400,8 +437,7 @@ exports.getJobs = async (req, res) => {
 };
 
 // ════════════════════════════════════════════════════════════════════════
-// ✅ NEW: EXPORT JOBS AS CSV (respects current filters)
-// GET /api/v1/jobs/export?postedBy=admin&status=Live&search=xyz...
+// ✅ EXPORT JOBS AS CSV
 // ════════════════════════════════════════════════════════════════════════
 exports.exportJobs = async (req, res) => {
   try {
@@ -452,14 +488,12 @@ exports.exportJobs = async (req, res) => {
     if (req.query.workMode && req.query.workMode !== "All") filter.workMode = req.query.workMode;
     if (req.query.featured === "true" || req.query.featured === true) filter.featured = true;
 
-    // Fetch ALL matching jobs (no pagination for export, cap at 10000 for safety)
     const rawJobs = await populateRecruiterSafe(
       Job.find(filter).sort({ createdAt: -1 }).limit(10000)
     );
 
     const jobs = rawJobs.map((j) => transformJobForFrontend(j));
 
-    // Build CSV
     const headers = [
       "Job ID",
       "Title",
@@ -549,12 +583,12 @@ exports.exportJobs = async (req, res) => {
     const filterSuffix = adminOnlyFlag ? "_admin" : recruiterOnlyFlag ? "_recruiter" : "_all";
     const filename = `SmileJobs_Jobs${filterSuffix}_${dateStr}.csv`;
 
-    // BOM for Excel UTF-8 compatibility
     const csvBuffer = Buffer.concat([Buffer.from("\uFEFF", "utf8"), Buffer.from(csv, "utf8")]);
 
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
     res.setHeader("Content-Length", csvBuffer.length);
+    res.setHeader("X-Export-Count", String(jobs.length));
     return res.status(200).send(csvBuffer);
   } catch (error) {
     console.error("exportJobs Error:", error);
@@ -667,7 +701,7 @@ exports.getAdminPostedJobs = async (req, res) => {
 };
 
 // ════════════════════════════════════════════════════════════════════════
-// MIGRATION ENDPOINT
+// MIGRATION ENDPOINT (now uses the STRICT detector)
 // ════════════════════════════════════════════════════════════════════════
 exports.migratePostedBy = async (req, res) => {
   try {
@@ -675,13 +709,18 @@ exports.migratePostedBy = async (req, res) => {
     let adminCount = 0;
     let recruiterCount = 0;
     let updatedCount = 0;
+    const details = [];
 
     for (const j of allJobs) {
       const isAdmin = detectIsAdminPosted(j);
       const newPostedBy = isAdmin ? "admin" : "recruiter";
       const newPostedByRole = j.postedByRole || (isAdmin ? "Super Admin" : "Recruiter");
-      const newPostedByName = j.postedByName || (isAdmin ? "Smile Jobs" : (j.contactPerson?.name || "Recruiter"));
-      const newPostedByEmail = j.postedByEmail || (isAdmin ? "smilejobs@gmail.com" : (j.recruiterEmail || ""));
+      const newPostedByName =
+        j.postedByName ||
+        (isAdmin ? "Smile Jobs" : (j.contactPerson?.name || "Recruiter"));
+      const newPostedByEmail =
+        j.postedByEmail ||
+        (isAdmin ? "smilejobs@gmail.com" : (j.recruiterEmail || ""));
 
       if (
         j.postedBy !== newPostedBy ||
@@ -701,6 +740,23 @@ exports.migratePostedBy = async (req, res) => {
           }
         );
         updatedCount++;
+        details.push({
+          id: j._id,
+          title: j.title,
+          company: j.companyName,
+          before: {
+            postedBy: j.postedBy,
+            postedByRole: j.postedByRole,
+            postedByName: j.postedByName,
+            postedByEmail: j.postedByEmail
+          },
+          after: {
+            postedBy: newPostedBy,
+            postedByRole: newPostedByRole,
+            postedByName: newPostedByName,
+            postedByEmail: newPostedByEmail
+          }
+        });
       }
 
       if (isAdmin) adminCount++;
@@ -713,7 +769,8 @@ exports.migratePostedBy = async (req, res) => {
       totalJobs: allJobs.length,
       updatedCount,
       adminCount,
-      recruiterCount
+      recruiterCount,
+      sampleUpdates: details.slice(0, 20)
     });
   } catch (error) {
     console.error("migratePostedBy Error:", error);
