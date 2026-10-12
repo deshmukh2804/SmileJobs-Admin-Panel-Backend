@@ -24,6 +24,10 @@ const applicationRoutes = require("./routes/applicationRoutes");
 const applicationHierarchyRoutes = require("./routes/applicationHierarchyRoutes");
 const dashboardRoutes = require("./routes/dashboardRoutes");
 
+// ✅ NEW: PRICING & PAYMENT DASHBOARD ROUTES
+const pricingRoutes = require("./routes/pricingRoutes");
+const paymentDashboardRoutes = require("./routes/paymentDashboardRoutes");
+
 const { seedDefaultRoles } = require("./controllers/roleController");
 
 const app = express();
@@ -83,7 +87,13 @@ const corsOptions = {
       cleanOrigin.endsWith(".onrender.com") ||
       cleanOrigin.endsWith(".netlify.app");
 
-    if (isExplicitlyAllowed || isCloudPreview) {
+    const isLocalNetwork =
+      cleanOrigin.includes("localhost") ||
+      cleanOrigin.includes("127.0.0.1") ||
+      cleanOrigin.includes("192.168.") ||
+      cleanOrigin.includes("10.0.");
+
+    if (isExplicitlyAllowed || isCloudPreview || isLocalNetwork) {
       return callback(null, true);
     }
 
@@ -98,6 +108,8 @@ const corsOptions = {
     "Accept",
     "Authorization",
     "x-auth-token",
+    "X-Service-API-Key",
+    "x-service-api-key",
   ],
   exposedHeaders: ["Content-Range", "X-Content-Range"],
   maxAge: 86400,
@@ -148,6 +160,10 @@ app.use("/api/v1/applications", applicationRoutes);
 
 app.use("/api/v1/dashboard", dashboardRoutes);
 app.use("/api/v1/payments-and-billing", require("./routes/billingRoutes"));
+
+// ✅ NEW: PRICING & PAYMENT DASHBOARD MOUNTS
+app.use("/api/v1/pricing", pricingRoutes);
+app.use("/api/v1/payment-dashboard", paymentDashboardRoutes);
 
 // Root alias support
 app.use("/jobs", jobRoutes);

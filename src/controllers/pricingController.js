@@ -1,6 +1,5 @@
 const ProfilePricing = require("../models/ProfilePricing");
 
-// 1. Get current pricing config
 exports.getPricingSettings = async (req, res) => {
   try {
     let config = await ProfilePricing.findOne();
@@ -18,7 +17,6 @@ exports.getPricingSettings = async (req, res) => {
   }
 };
 
-// 2. Update profile price directly in MongoDB
 exports.updatePricingSettings = async (req, res) => {
   try {
     const { enabled, price, currency } = req.body;
@@ -39,7 +37,7 @@ exports.updatePricingSettings = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: "Profile price updated successfully in database!",
+      message: "Profile price updated successfully!",
       data: config
     });
   } catch (err) {
@@ -47,12 +45,14 @@ exports.updatePricingSettings = async (req, res) => {
   }
 };
 
-// 3. Public API for Recruiter Website (No auth required)
 exports.getPublicPricing = async (req, res) => {
   try {
     let config = await ProfilePricing.findOne();
     if (!config) {
-      config = { enabled: true, price: 100, priceInPaise: 10000, currency: "INR" };
+      return res.status(200).json({
+        success: true,
+        data: { enabled: true, price: 100, priceInPaise: 10000, currency: "INR" }
+      });
     }
     return res.status(200).json({
       success: true,
