@@ -1,18 +1,12 @@
-// ============================================================================
-// SmileJobs — Payment Dashboard Routes
-// Path: backend/src/routes/paymentDashboardRoutes.js
-// ============================================================================
-
 const express = require("express");
 const router = express.Router();
-const { protect } = require("../middleware/authMiddleware");
-const { requireServiceAuth } = require("../middleware/serviceAuth");
 const paymentController = require("../controllers/paymentController");
+const { protect } = require("../middleware/authMiddleware");
 
-// Service-to-Service: Recruiter website pushes transaction
-router.post("/service/transactions", requireServiceAuth, paymentController.syncServiceTransaction);
+// Webhook or recruiter S2S Integration (No strict token required, or can use S2S key)
+router.post("/service/transactions", paymentController.syncServiceTransaction);
 
-// Admin only
+// Admin dashboard routes
 router.get("/stats", protect, paymentController.getStatsSummary);
 router.get("/transactions", protect, paymentController.getTransactions);
 router.post("/transactions/:id/refund", protect, paymentController.processRefund);
