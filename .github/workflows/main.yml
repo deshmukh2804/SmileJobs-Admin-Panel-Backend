@@ -101,14 +101,15 @@ jobs:
 
           echo "Connected to DigitalOcean successfully."
 
-          cd /var/www/smilejobs-admin-backend
+          # ✅ FIXED: Navigating to the actual live folder
+          cd /var/www/smilejobs-admin
 
-          echo "Fetching latest code..."
+          echo "Fetching latest code from main..."
           git fetch origin main
           git reset --hard origin/main
 
-          echo "Installing production dependencies..."
-          npm install --omit=dev --legacy-peer-deps --no-audit --no-fund
+          echo "Installing dependencies..."
+          npm install --legacy-peer-deps --no-audit --no-fund
 
           echo "Checking PM2 process..."
 
