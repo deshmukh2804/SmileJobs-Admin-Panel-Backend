@@ -198,7 +198,7 @@ const transformJobForFrontend = (job) => {
 exports.getJobs = async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit) || 50));
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 50));
     const skip = (page - 1) * limit;
 
     const filter = {};
@@ -209,9 +209,23 @@ exports.getJobs = async (req, res) => {
     if (req.query.approvalStatus && req.query.approvalStatus !== "All") {
       filter.approvalStatus = req.query.approvalStatus;
     }
-    if (req.query.postedBy && req.query.postedBy !== "All") {
+
+    // ════════════════════════════════════════════════════════════════
+    // ✅ ADMIN-ONLY FILTER LOGIC (NEW)
+    // Supports: ?postedBy=admin  OR  ?adminOnly=true  OR  ?source=admin
+    // ════════════════════════════════════════════════════════════════
+    const adminOnlyFlag =
+      String(req.query.adminOnly || "").toLowerCase() === "true" ||
+      String(req.query.source || "").toLowerCase() === "admin" ||
+      String(req.query.postedBy || "").toLowerCase() === "admin";
+
+    if (adminOnlyFlag) {
+      // Strict admin filter — exclude any recruiter-posted jobs
+      filter.postedBy = "admin";
+    } else if (req.query.postedBy && req.query.postedBy !== "All") {
       filter.postedBy = req.query.postedBy.toLowerCase();
     }
+
     if (req.query.search && req.query.search.trim()) {
       const s = req.query.search.trim();
       filter.$or = [
@@ -229,11 +243,14 @@ exports.getJobs = async (req, res) => {
 
     const jobs = rawJobs.map((j) => transformJobForFrontend(j));
 
+    // ✅ Counts also respect admin filter if active
+    const countsFilter = adminOnlyFlag ? { postedBy: "admin" } : {};
+
     const [total, live, pending, rejected] = await Promise.all([
-      Job.countDocuments({}),
-      Job.countDocuments({ status: "Live" }),
-      Job.countDocuments({ approvalStatus: "pending_review" }),
-      Job.countDocuments({ approvalStatus: "rejected" })
+      Job.countDocuments(countsFilter),
+      Job.countDocuments({ ...countsFilter, status: "Live" }),
+      Job.countDocuments({ ...countsFilter, approvalStatus: "pending_review" }),
+      Job.countDocuments({ ...countsFilter, approvalStatus: "rejected" })
     ]);
 
     return res.status(200).json({
@@ -258,6 +275,110 @@ exports.getJobs = async (req, res) => {
     });
   } catch (error) {
     console.error("getJobs Error:", error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ════════════════════════════════════════════════════════════════
+// ✅ NEW DEDICATED ENDPOINT: GET ONLY ADMIN-POSTED JOBS
+// Called via GET /api/v1/jobs/admin-posted
+// ════════════════════════════════════════════════════════════════
+exports.getAdminPostedJobs = async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 200));
+    const skip = (page - 1) * limit;
+
+    // STRICT FILTER: only admin-posted jobs, excludes any recruiter jobs
+    const filter = { postedBy: "admin" };
+
+    if (req.query.status && req.query.status !== "All" && req.query.status !== "") {
+      filter.status = req.query.status;
+    }
+    if (req.query.approvalStatus && req.query.approvalStatus !== "All") {
+      filter.approvalStatus = req.query.approvalStatus;
+    }
+    if (req.query.search && req.query.search.trim()) {
+      const s = req.query.search.trim();
+      filter.$or = [
+        { title: { $regex: s, $options: "i" } },
+        { companyName: { $regex: s, $options: "i" } },
+        { "location.city": { $regex: s, $options: "i" } },
+        { "location.state": { $regex: s, $options: "i" } }
+      ];
+    }
+
+    const [rawJobs, totalCount] = await Promise.all([
+      populateRecruiterSafe(Job.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit)),
+      Job.countDocuments(filter)
+    ]);
+
+    // Transform to the shape AdminJobsView expects — includes application stat placeholders
+    const Application = (() => {
+      try { return require("../models/Application"); } catch { return null; }
+    })();
+
+    const jobs = await Promise.all(
+      rawJobs.map(async (j) => {
+        const base = transformJobForFrontend(j);
+        let applicationCount = base.applicantsCount || 0;
+        let pendingCount = 0;
+        let hiredCount = 0;
+        let shortlistedCount = 0;
+
+        if (Application) {
+          try {
+            const jobId = base._id;
+            const [appCount, pCount, hCount, sCount] = await Promise.all([
+              Application.countDocuments({ jobId }),
+              Application.countDocuments({ jobId, status: { $in: ["Applied", "Viewed"] } }),
+              Application.countDocuments({ jobId, status: "Hired" }),
+              Application.countDocuments({ jobId, status: "Shortlisted" })
+            ]);
+            applicationCount = appCount;
+            pendingCount = pCount;
+            hiredCount = hCount;
+            shortlistedCount = sCount;
+          } catch (err) {
+            // silently continue; stats are optional
+          }
+        }
+
+        return {
+          ...base,
+          jobId: base._id,
+          companyLogo: base.companyLogo?.url || null,
+          applicationCount,
+          pendingCount,
+          hiredCount,
+          shortlistedCount
+        };
+      })
+    );
+
+    const [total, live, pending, rejected] = await Promise.all([
+      Job.countDocuments({ postedBy: "admin" }),
+      Job.countDocuments({ postedBy: "admin", status: "Live" }),
+      Job.countDocuments({ postedBy: "admin", approvalStatus: "pending_review" }),
+      Job.countDocuments({ postedBy: "admin", approvalStatus: "rejected" })
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      data: jobs,
+      jobs,
+      counts: { total, live, pending, rejected, activeJobs: live },
+      pagination: {
+        page,
+        limit,
+        total: totalCount,
+        totalItems: totalCount,
+        pages: Math.ceil(totalCount / limit) || 1,
+        totalPages: Math.ceil(totalCount / limit) || 1
+      }
+    });
+  } catch (error) {
+    console.error("getAdminPostedJobs Error:", error);
     return res.status(500).json({ success: false, message: error.message });
   }
 };

@@ -13,12 +13,17 @@ const {
   toggleFeature,
   toggleStatus,
   updateContactVisibility,
+  getAdminPostedJobs, // ✅ NEW
 } = require("../controllers/jobController");
 const { protect } = require("../middleware/authMiddleware");
 const upload = require("../utils/uploadMiddleware");
 
 // Public routes (candidate app reads these)
 router.get("/", getJobs);
+
+// ✅ IMPORTANT: Place this BEFORE /:id to avoid route conflict
+router.get("/admin-posted", getAdminPostedJobs);
+
 router.get("/:id", getJobById);
 
 // Protected routes
