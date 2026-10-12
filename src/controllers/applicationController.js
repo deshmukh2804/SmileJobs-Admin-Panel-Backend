@@ -132,6 +132,20 @@ const isValidTransition = (currentStatus, newStatus) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
+// CSV HELPER — escapes a value for safe CSV output
+// ═══════════════════════════════════════════════════════════════
+const csvEscape = (val) => {
+  if (val === null || val === undefined) return "";
+  let str = typeof val === "string" ? val : String(val);
+  // Strip newlines/tabs that corrupt CSV rows
+  str = str.replace(/\r?\n|\r/g, " ").replace(/\t/g, " ");
+  if (str.includes(",") || str.includes('"') || str.includes("'")) {
+    str = `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+};
+
+// ═══════════════════════════════════════════════════════════════
 // ENRICHMENT HELPER: Attach recruiter + user info to applications
 // Also transforms resume URLs to use the proxy endpoint
 // ═══════════════════════════════════════════════════════════════
@@ -819,6 +833,249 @@ const bulkUpdateStatus = async (req, res) => {
   }
 };
 
+// ═══════════════════════════════════════════════════════════════
+// @desc    Export applications as CSV (respects filters + tenant isolation)
+// @route   GET /api/v1/applications/export
+// ═══════════════════════════════════════════════════════════════
+const exportApplications = async (req, res) => {
+  try {
+    const authUser = req.authUser;
+    const {
+      search,
+      status,
+      category,
+      jobId,
+      userId,
+      matchMin,
+      matchMax,
+      city,
+      ids, // comma-separated list for "export selected"
+      sortBy = "appliedAt",
+      sortOrder = "desc",
+    } = req.query;
+
+    const filter = {};
+
+    // 🛡️ Apply Secure Recruiter Scoping (Tenant Isolation)
+    const isAuthorized = await applyRecruiterScope(filter, authUser, jobId);
+    if (!isAuthorized) {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied for export",
+      });
+    }
+
+    // Filter by selected IDs if provided
+    if (ids && typeof ids === "string") {
+      const idArray = ids.split(",").map(s => s.trim()).filter(Boolean);
+      if (idArray.length > 0) {
+        const objectIds = idArray.map(id => {
+          try { return new mongoose.Types.ObjectId(id); } catch { return null; }
+        }).filter(Boolean);
+        filter._id = { $in: [...idArray, ...objectIds] };
+      }
+    }
+
+    if (search) {
+      const searchOr = [
+        { candidateName: { $regex: search, $options: "i" } },
+        { candidateEmail: { $regex: search, $options: "i" } },
+        { candidatePhone: { $regex: search, $options: "i" } },
+        { jobTitle: { $regex: search, $options: "i" } },
+        { jobCompany: { $regex: search, $options: "i" } },
+      ];
+      // Merge safely with any existing $or (e.g. from scope)
+      if (filter.$or) {
+        filter.$and = filter.$and || [];
+        filter.$and.push({ $or: filter.$or });
+        filter.$and.push({ $or: searchOr });
+        delete filter.$or;
+      } else {
+        filter.$or = searchOr;
+      }
+    }
+
+    if (status && status !== "all") filter.status = status;
+    if (category && category !== "all") filter.category = category;
+
+    if (userId) {
+      let userObjectId;
+      try { userObjectId = new mongoose.Types.ObjectId(userId); } catch (e) { userObjectId = null; }
+      filter.userId = { $in: [userId, userObjectId].filter(Boolean) };
+    }
+
+    if (city) filter.candidateCity = { $regex: city, $options: "i" };
+
+    if (matchMin || matchMax) {
+      filter.matchPercentage = {};
+      if (matchMin) filter.matchPercentage.$gte = parseInt(matchMin);
+      if (matchMax) filter.matchPercentage.$lte = parseInt(matchMax);
+    }
+
+    const sortObj = { [sortBy]: sortOrder === "asc" ? 1 : -1 };
+
+    // Hard cap at 10,000 rows for safety
+    const applications = await Application.find(filter)
+      .sort(sortObj)
+      .limit(10000);
+
+    // Enrich with recruiter + user info
+    const enriched = await enrichApplications(applications);
+
+    // ═══════════ BUILD CSV ═══════════
+    const headers = [
+      "Application ID",
+      "Applied At",
+      "Status",
+      "Category",
+      "Match %",
+      // Candidate
+      "Candidate Name",
+      "Candidate Email",
+      "Candidate Phone",
+      "Candidate City",
+      "Candidate Sub-Location",
+      "Candidate Job Title",
+      "Candidate Current Company",
+      "Candidate Current Salary",
+      "Candidate Experience (yrs)",
+      "Candidate Experience Level",
+      "Candidate English Level",
+      "Candidate Skills",
+      "Candidate Languages",
+      "Candidate Assets",
+      "Candidate Certifications",
+      // Education
+      "Education Degree",
+      "Education Specialization",
+      "Education College",
+      "Education End Year",
+      // Account
+      "Account Active",
+      "Account Member Since",
+      // Job
+      "Job ID",
+      "Job Title",
+      "Job Company",
+      "Job Location",
+      "Job Salary",
+      "Job Type",
+      "Job Work Mode",
+      // Recruiter
+      "Recruiter ID",
+      "Recruiter Name",
+      "Recruiter Email",
+      "Recruiter Mobile",
+      "Recruiter WhatsApp",
+      "Recruiter Designation",
+      "Recruiter Company",
+      "Recruiter Verified",
+      // Job HR (fallback)
+      "Job HR Name",
+      "Job HR Role",
+      "Job HR Phone",
+      "Job HR WhatsApp",
+      // Other
+      "Cover Note",
+      "HR Notes",
+      "Resume URL",
+      "Resume Original URL",
+      "Resume File Name",
+      "Created At",
+    ];
+
+    const rows = enriched.map((app) => {
+      const edu = app.candidateEducation || {};
+      const acc = app.candidateAccount || {};
+      const job = app.jobDetails || {};
+      const rec = app.recruiter || {};
+
+      return [
+        app._id,
+        app.appliedAt ? new Date(app.appliedAt).toISOString() : "",
+        app.status,
+        app.category,
+        app.matchPercentage,
+
+        app.candidateName,
+        app.candidateEmail,
+        app.candidatePhone,
+        app.candidateCity,
+        app.candidateSubLocation,
+        app.candidateJobTitle,
+        app.candidateCurrentCompany,
+        app.candidateCurrentSalary,
+        app.candidateExperience,
+        app.candidateExperienceLevel,
+        app.candidateEnglishLevel,
+        Array.isArray(app.candidateSkills) ? app.candidateSkills.join(" | ") : "",
+        Array.isArray(app.candidateLanguages) ? app.candidateLanguages.join(" | ") : "",
+        Array.isArray(app.candidateAssets) ? app.candidateAssets.join(" | ") : "",
+        Array.isArray(app.candidateCertifications) ? app.candidateCertifications.join(" | ") : "",
+
+        edu.degree,
+        edu.specialization,
+        edu.collegeName,
+        edu.endYear,
+
+        acc.isActive === true ? "Yes" : acc.isActive === false ? "No" : "",
+        acc.memberSince ? new Date(acc.memberSince).toISOString() : "",
+
+        app.jobId,
+        app.jobTitle,
+        app.jobCompany,
+        app.jobLocation,
+        app.jobSalary,
+        job.jobType,
+        job.workMode,
+
+        rec.id || "",
+        rec.name || "",
+        rec.email || "",
+        rec.mobileNumber || "",
+        rec.whatsappNumber || "",
+        rec.designation || "",
+        rec.companyName || "",
+        rec.verified ? "Yes" : "No",
+
+        app.jobHrName,
+        app.jobHrRole,
+        app.jobHrPhone,
+        app.jobHrWhatsapp,
+
+        app.coverNote,
+        app.hrNotes,
+        app.resumeUrl,
+        app.resumeOriginalUrl,
+        app.resumeFileName,
+        app.createdAt ? new Date(app.createdAt).toISOString() : "",
+      ].map(csvEscape).join(",");
+    });
+
+    // UTF-8 BOM for Excel compatibility
+    const BOM = "\uFEFF";
+    const csv = BOM + headers.map(csvEscape).join(",") + "\n" + rows.join("\n");
+
+    // Dynamic filename
+    const dateStr = new Date().toISOString().slice(0, 10);
+    let suffix = "_all";
+    if (status && status !== "all") suffix = `_${String(status).toLowerCase()}`;
+    if (ids) suffix = "_selected";
+    const filename = `SmileJobs_Applications${suffix}_${dateStr}.csv`;
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("X-Export-Count", String(enriched.length));
+    return res.status(200).send(csv);
+  } catch (error) {
+    console.error("Export Applications Error:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "Server error while exporting applications",
+    });
+  }
+};
+
 module.exports = {
   getApplications,
   getApplicationById,
@@ -827,4 +1084,5 @@ module.exports = {
   getApplicationsByJob,
   getApplicationsByUser,
   bulkUpdateStatus,
+  exportApplications,
 };

@@ -9,6 +9,7 @@ const {
   getApplicationsByJob,
   getApplicationsByUser,
   bulkUpdateStatus,
+  exportApplications,
 } = require("../controllers/applicationController");
 const { authenticateAny } = require("../middleware/roleMiddleware");
 
@@ -19,6 +20,9 @@ router.use(authenticateAny);
 
 // GET all applications
 router.get("/", getApplications);
+
+// ✅ NEW: Export applications as CSV (MUST be before /:id to avoid route conflict)
+router.get("/export", exportApplications);
 
 // PATCH bulk update statuses
 router.patch("/bulk-status", bulkUpdateStatus);
