@@ -36,6 +36,52 @@ const getCategoryForStatus = (status) => {
   return "rejected"; // Rejected, Withdrawn
 };
 
+// ════════════════════════════════════════════════════════════════
+// ✅ NEW HELPER: Convert location object → readable string
+// ════════════════════════════════════════════════════════════════
+const formatLocationString = (loc) => {
+  if (!loc) return "";
+  if (typeof loc === "string") return loc;
+  if (typeof loc === "object") {
+    const parts = [loc.city, loc.state, loc.country].filter(Boolean);
+    if (parts.length > 0) return parts.join(", ");
+    if (loc.address) return loc.address;
+  }
+  return "";
+};
+
+// ════════════════════════════════════════════════════════════════
+// ✅ NEW HELPER: Convert salary object → readable string
+// ════════════════════════════════════════════════════════════════
+const formatSalaryString = (sal) => {
+  if (!sal) return "Not Disclosed";
+  if (typeof sal === "string") return sal;
+  if (typeof sal === "object") {
+    const min = sal.min || 0;
+    const max = sal.max || 0;
+    const currency = sal.currency || "INR";
+    const symbol = currency === "INR" ? "₹" : currency;
+    const period = sal.period || "month";
+    if (min || max) {
+      return `${symbol}${min} - ${symbol}${max} / ${period}`;
+    }
+  }
+  return "Not Disclosed";
+};
+
+// ════════════════════════════════════════════════════════════════
+// ✅ NEW HELPER: Derive recruiter name (admin jobs fallback)
+// ════════════════════════════════════════════════════════════════
+const deriveRecruiterName = (j) => {
+  return (
+    j.recruiterName ||
+    j.postedByName ||
+    (j.postedBy === "admin" ? "Smile Jobs (Admin)" : "") ||
+    j.contactPerson?.name ||
+    "—"
+  );
+};
+
 /**
  * Admin: Get all companies with recruiter & job counters
  */
@@ -122,6 +168,7 @@ exports.getCompaniesWithStats = async (req, res) => {
 
 /**
  * Admin: Get jobs posted by a company (via recruiter association)
+ * ✅ FIXED: location and salary returned as readable strings
  */
 exports.getJobsByCompany = async (req, res) => {
   try {
@@ -147,6 +194,16 @@ exports.getJobsByCompany = async (req, res) => {
       try { return new mongoose.Types.ObjectId(id); } catch { return null; }
     }).filter(Boolean);
 
+    // Build a map of recruiterId → recruiter info so we can derive recruiterName for admin UI
+    const recruiterMap = {};
+    for (const r of recruiters) {
+      recruiterMap[r._id.toString()] = {
+        name: r.name || "",
+        email: r.email || "",
+        companyName: r.companyProfile?.name || r.companyName || ""
+      };
+    }
+
     const jobs = await Job.find({ 
       recruiterId: { $in: [...recruiterObjectIds, ...recruiterIds] }
     }).lean();
@@ -164,8 +221,27 @@ exports.getJobsByCompany = async (req, res) => {
       const pending = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: { $in: ["Applied", "Viewed"] } });
       const hired = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: "Hired" });
 
+      // ✅ Derive clean readable fields
+      const recId = j.recruiterId ? j.recruiterId.toString() : null;
+      const recInfo = recId ? recruiterMap[recId] : null;
+
+      const recruiterName = (recInfo && recInfo.name) || deriveRecruiterName(j);
+      const locationString = formatLocationString(j.location);
+      const salaryString = formatSalaryString(j.salary);
+
       enriched.push({
+        // original job fields preserved
         ...j,
+        // ✅ Add normalized string fields the frontend expects
+        jobId: jobIdStr,
+        id: jobIdStr,
+        location: locationString,          // ← string, no more [object Object]
+        locationObject: j.location || null, // keep original object for anyone needing it
+        salary: salaryString,              // ← string
+        salaryRange: salaryString,
+        salaryObject: j.salary || null,
+        recruiterName,
+        recruiterEmail: recInfo?.email || j.recruiterEmail || "",
         applicationCount: total,
         pendingCount: pending,
         hiredCount: hired
@@ -209,12 +285,21 @@ exports.getJobApplicationsForAdmin = async (req, res) => {
 
 /**
  * Admin: Fetch jobs posted by a specific recruiter profile
+ * ✅ FIXED: location + salary strings + recruiter name
  */
 exports.getRecruiterJobsForAdmin = async (req, res) => {
   try {
     const { recruiterId } = req.params;
     let recObjectId;
     try { recObjectId = new mongoose.Types.ObjectId(recruiterId); } catch (e) { recObjectId = null; }
+
+    // Resolve recruiter for name/email derivation
+    const recruiterDoc = await Recruiter.findOne({
+      $or: [
+        { _id: recObjectId },
+        { _id: recruiterId }
+      ]
+    }).lean().catch(() => null);
 
     const jobs = await Job.find({
       recruiterId: { $in: [recruiterId, recObjectId].filter(Boolean) }
@@ -233,8 +318,21 @@ exports.getRecruiterJobsForAdmin = async (req, res) => {
       const pending = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: { $in: ["Applied", "Viewed"] } });
       const hired = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: "Hired" });
 
+      const recruiterName = recruiterDoc?.name || deriveRecruiterName(j);
+      const locationString = formatLocationString(j.location);
+      const salaryString = formatSalaryString(j.salary);
+
       enriched.push({
         ...j,
+        jobId: jobIdStr,
+        id: jobIdStr,
+        location: locationString,
+        locationObject: j.location || null,
+        salary: salaryString,
+        salaryRange: salaryString,
+        salaryObject: j.salary || null,
+        recruiterName,
+        recruiterEmail: recruiterDoc?.email || j.recruiterEmail || "",
         applicationCount: total,
         pendingCount: pending,
         hiredCount: hired
@@ -251,6 +349,7 @@ exports.getRecruiterJobsForAdmin = async (req, res) => {
 /**
  * Admin: Get ALL jobs posted directly by Admin panel with fallback detection
  * Enhanced to detect multiple possible admin-post identifiers in the database.
+ * ✅ FIXED: location + salary returned as readable strings
  */
 exports.getAdminPostedJobs = async (req, res) => {
   try {
@@ -288,10 +387,15 @@ exports.getAdminPostedJobs = async (req, res) => {
       const pending = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: { $in: ["Applied", "Viewed"] } });
       const hired = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: "Hired" });
 
+      const locationString = formatLocationString(j.location);
+      const salaryString = formatSalaryString(j.salary);
+      const recruiterName = deriveRecruiterName(j);
+
       // Provide a normalized shape so the frontend doesn't crash on missing fields
       enriched.push({
         _id: j._id,
         id: jobIdStr,
+        jobId: jobIdStr,
         title: j.title || "Untitled Job",
         companyName: j.companyName || j.company || "Admin Platform",
         companyLogo: j.companyLogo?.url || j.companyLogo || null,
@@ -302,8 +406,12 @@ exports.getAdminPostedJobs = async (req, res) => {
         postedAt: j.postedAt || j.createdAt,
         createdByAdmin: true,
         recruiterId: j.recruiterId || null,
-        location: j.location || "",
-        salary: j.salary || "",
+        recruiterName,                   // ✅ derived (Smile Jobs for admin posts)
+        location: locationString,        // ✅ string, no [object Object]
+        locationObject: j.location || null,
+        salary: salaryString,            // ✅ string
+        salaryRange: salaryString,
+        salaryObject: j.salary || null,
         applicationCount: total,
         pendingCount: pending,
         hiredCount: hired,
@@ -387,6 +495,11 @@ exports.getRecruiterJobsWithStats = async (req, res) => {
     let recObjectId;
     try { recObjectId = new mongoose.Types.ObjectId(recruiterId); } catch (e) { recObjectId = null; }
 
+    // Resolve recruiter doc for name mapping
+    const recruiterDoc = await Recruiter.findOne({
+      $or: [{ _id: recObjectId }, { _id: recruiterId }]
+    }).lean().catch(() => null);
+
     const jobs = await Job.find({ 
       recruiterId: { $in: [recruiterId, recObjectId].filter(Boolean) } 
     }).lean();
@@ -403,8 +516,20 @@ exports.getRecruiterJobsWithStats = async (req, res) => {
       const pending = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: { $in: ["Applied", "Viewed"] } });
       const hired = await Application.countDocuments({ jobId: { $in: jobIdsArray }, status: "Hired" });
 
+      const locationString = formatLocationString(j.location);
+      const salaryString = formatSalaryString(j.salary);
+      const recruiterName = recruiterDoc?.name || deriveRecruiterName(j);
+
       data.push({
         ...j,
+        jobId: jobIdStr,
+        id: jobIdStr,
+        location: locationString,
+        locationObject: j.location || null,
+        salary: salaryString,
+        salaryRange: salaryString,
+        salaryObject: j.salary || null,
+        recruiterName,
         applicationCount: total,
         pendingCount: pending,
         hiredCount: hired
