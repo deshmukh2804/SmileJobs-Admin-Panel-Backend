@@ -1,3 +1,4 @@
+// FILE: backend/src/controllers/jobController.js
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 const Job = require("../models/Job");
@@ -77,7 +78,52 @@ const generateInitials = (name) => {
   );
 };
 
-// Transform Job for API responses matching your exact requested format
+// ════════════════════════════════════════════════════════════════════════
+// ✅ SMART ADMIN DETECTION — determines if a job was posted by Admin
+// Priority:
+//   1. Explicit `postedBy === 'admin'` field
+//   2. `postedByRole` contains 'admin' or 'super admin'
+//   3. `postedByEmail` matches known admin emails
+//   4. `approvedBy === 'Smile Jobs'` and `approvalStatus === 'approved'` without recruiterId
+//   5. No `recruiterId` populated → likely admin posted
+// ════════════════════════════════════════════════════════════════════════
+const detectIsAdminPosted = (job) => {
+  if (!job) return false;
+  const j = typeof job.toObject === "function" ? job.toObject() : job;
+
+  // 1. Explicit postedBy flag
+  if (String(j.postedBy || "").toLowerCase() === "admin") return true;
+  if (String(j.postedBy || "").toLowerCase() === "recruiter") return false;
+
+  // 2. Role-based detection
+  const role = String(j.postedByRole || "").toLowerCase().trim();
+  if (role === "admin" || role === "super admin" || role === "superadmin" || role === "sub admin" || role === "subadmin") {
+    return true;
+  }
+  if (role === "recruiter" || role === "employer" || role === "hr") {
+    return false;
+  }
+
+  // 3. Email-based detection (known admin emails)
+  const adminEmails = ["smilejobs@gmail.com", "admin@smilejobs.com", "admin@careerflow.com"];
+  const email = String(j.postedByEmail || "").toLowerCase().trim();
+  if (email && adminEmails.includes(email)) return true;
+
+  // 4. Name-based fallback
+  const name = String(j.postedByName || "").toLowerCase().trim();
+  if (name === "smile jobs" || name === "smilejobs" || name === "admin") return true;
+
+  // 5. No recruiterId = admin posted (because recruiter-posted jobs always have recruiterId)
+  if (!j.recruiterId) return true;
+
+  // Default: recruiter
+  return false;
+};
+
+// ════════════════════════════════════════════════════════════════════════
+// Transform Job for API responses — PRESERVES ACTUAL DB VALUES
+// Does NOT override postedBy fields with "admin" fallback
+// ════════════════════════════════════════════════════════════════════════
 const transformJobForFrontend = (job) => {
   if (!job) return null;
   const j = typeof job.toObject === "function" ? job.toObject() : job;
@@ -98,6 +144,42 @@ const transformJobForFrontend = (job) => {
   if (j.location) {
     const parts = [j.location.address, j.location.city, j.location.state].filter(Boolean);
     locationDisplay = parts.join(", ");
+  }
+
+  // ✅ SMART DETECTION — Determine actual poster type
+  const isAdminPosted = detectIsAdminPosted(j);
+  const resolvedPostedBy = isAdminPosted ? "admin" : "recruiter";
+
+  // ✅ Resolve poster name intelligently
+  let resolvedPostedByName = j.postedByName || "";
+  if (!resolvedPostedByName) {
+    if (isAdminPosted) {
+      resolvedPostedByName = "Smile Jobs";
+    } else if (j.recruiterId && typeof j.recruiterId === "object" && j.recruiterId.name) {
+      resolvedPostedByName = j.recruiterId.name;
+    } else if (j.contactPerson?.name) {
+      resolvedPostedByName = j.contactPerson.name;
+    } else {
+      resolvedPostedByName = "Unknown";
+    }
+  }
+
+  // ✅ Resolve poster email
+  let resolvedPostedByEmail = j.postedByEmail || "";
+  if (!resolvedPostedByEmail) {
+    if (isAdminPosted) {
+      resolvedPostedByEmail = "smilejobs@gmail.com";
+    } else if (j.recruiterId && typeof j.recruiterId === "object" && j.recruiterId.email) {
+      resolvedPostedByEmail = j.recruiterId.email;
+    } else if (j.recruiterEmail) {
+      resolvedPostedByEmail = j.recruiterEmail;
+    }
+  }
+
+  // ✅ Resolve poster role
+  let resolvedPostedByRole = j.postedByRole || "";
+  if (!resolvedPostedByRole) {
+    resolvedPostedByRole = isAdminPosted ? "Super Admin" : "Recruiter";
   }
 
   return {
@@ -173,11 +255,13 @@ const transformJobForFrontend = (job) => {
     featured: Boolean(j.featured),
     isNew: true,
     isCompanyVerified: Boolean(j.isCompanyVerified),
-    postedBy: j.postedBy || "admin",
+    // ✅ RESOLVED FIELDS (smart detection applied)
+    postedBy: resolvedPostedBy,
     postedByUserId: j.postedByUserId || "",
-    postedByName: j.postedByName || "Smile Jobs",
-    postedByEmail: j.postedByEmail || "smilejobs@gmail.com",
-    postedByRole: j.postedByRole || "Super Admin",
+    postedByName: resolvedPostedByName,
+    postedByEmail: resolvedPostedByEmail,
+    postedByRole: resolvedPostedByRole,
+    isAdminPosted,
     approvalStatus: j.approvalStatus || "approved",
     submittedForReviewAt: j.submittedForReviewAt || j.createdAt || new Date(),
     approvedAt: j.approvedAt || new Date(),
@@ -193,6 +277,28 @@ const transformJobForFrontend = (job) => {
     __v: j.__v ?? 0
   };
 };
+
+// ════════════════════════════════════════════════════════════════════════
+// Build smart admin filter for MongoDB queries
+// Matches jobs where: postedBy='admin' OR known admin role/email/name
+// ════════════════════════════════════════════════════════════════════════
+const buildAdminFilter = () => ({
+  $or: [
+    { postedBy: "admin" },
+    { postedByRole: { $in: ["Super Admin", "admin", "Admin", "Sub Admin", "superadmin", "subadmin"] } },
+    { postedByEmail: { $in: ["smilejobs@gmail.com", "admin@smilejobs.com", "admin@careerflow.com"] } },
+    { postedByName: { $in: ["Smile Jobs", "smilejobs", "Admin"] } }
+  ]
+});
+
+const buildRecruiterFilter = () => ({
+  $and: [
+    { postedBy: { $ne: "admin" } },
+    { postedByRole: { $nin: ["Super Admin", "admin", "Admin", "Sub Admin", "superadmin", "subadmin"] } },
+    { postedByEmail: { $nin: ["smilejobs@gmail.com", "admin@smilejobs.com", "admin@careerflow.com"] } },
+    { recruiterId: { $exists: true, $ne: null } }
+  ]
+});
 
 // 1. GET ALL JOBS
 exports.getJobs = async (req, res) => {
@@ -211,29 +317,49 @@ exports.getJobs = async (req, res) => {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // ✅ ADMIN-ONLY FILTER LOGIC (NEW)
-    // Supports: ?postedBy=admin  OR  ?adminOnly=true  OR  ?source=admin
+    // ✅ SMART ADMIN / RECRUITER FILTER LOGIC
     // ════════════════════════════════════════════════════════════════
     const adminOnlyFlag =
       String(req.query.adminOnly || "").toLowerCase() === "true" ||
       String(req.query.source || "").toLowerCase() === "admin" ||
       String(req.query.postedBy || "").toLowerCase() === "admin";
 
+    const recruiterOnlyFlag =
+      String(req.query.recruiterOnly || "").toLowerCase() === "true" ||
+      String(req.query.source || "").toLowerCase() === "recruiter" ||
+      String(req.query.postedBy || "").toLowerCase() === "recruiter";
+
     if (adminOnlyFlag) {
-      // Strict admin filter — exclude any recruiter-posted jobs
-      filter.postedBy = "admin";
-    } else if (req.query.postedBy && req.query.postedBy !== "All") {
-      filter.postedBy = req.query.postedBy.toLowerCase();
+      Object.assign(filter, buildAdminFilter());
+    } else if (recruiterOnlyFlag) {
+      Object.assign(filter, buildRecruiterFilter());
     }
 
     if (req.query.search && req.query.search.trim()) {
       const s = req.query.search.trim();
-      filter.$or = [
+      const searchOr = [
         { title: { $regex: s, $options: "i" } },
         { companyName: { $regex: s, $options: "i" } },
         { "location.city": { $regex: s, $options: "i" } },
         { "location.state": { $regex: s, $options: "i" } }
       ];
+      // Merge with existing $or if present
+      if (filter.$or) {
+        filter.$and = [{ $or: filter.$or }, { $or: searchOr }];
+        delete filter.$or;
+      } else {
+        filter.$or = searchOr;
+      }
+    }
+
+    if (req.query.jobType && req.query.jobType !== "All") {
+      filter.jobType = req.query.jobType;
+    }
+    if (req.query.workMode && req.query.workMode !== "All") {
+      filter.workMode = req.query.workMode;
+    }
+    if (req.query.featured === "true" || req.query.featured === true) {
+      filter.featured = true;
     }
 
     const [rawJobs, totalCount] = await Promise.all([
@@ -243,14 +369,14 @@ exports.getJobs = async (req, res) => {
 
     const jobs = rawJobs.map((j) => transformJobForFrontend(j));
 
-    // ✅ Counts also respect admin filter if active
-    const countsFilter = adminOnlyFlag ? { postedBy: "admin" } : {};
-
-    const [total, live, pending, rejected] = await Promise.all([
-      Job.countDocuments(countsFilter),
-      Job.countDocuments({ ...countsFilter, status: "Live" }),
-      Job.countDocuments({ ...countsFilter, approvalStatus: "pending_review" }),
-      Job.countDocuments({ ...countsFilter, approvalStatus: "rejected" })
+    // ✅ COUNTS — Include adminPosted & recruiterPosted ALWAYS
+    const [total, live, pending, rejected, adminPosted, recruiterPosted] = await Promise.all([
+      Job.countDocuments({}),
+      Job.countDocuments({ status: "Live" }),
+      Job.countDocuments({ approvalStatus: "pending_review" }),
+      Job.countDocuments({ approvalStatus: "rejected" }),
+      Job.countDocuments(buildAdminFilter()),
+      Job.countDocuments(buildRecruiterFilter())
     ]);
 
     return res.status(200).json({
@@ -262,7 +388,9 @@ exports.getJobs = async (req, res) => {
         live,
         pending,
         rejected,
-        activeJobs: live
+        activeJobs: live,
+        adminPosted,
+        recruiterPosted
       },
       pagination: {
         page,
@@ -280,7 +408,7 @@ exports.getJobs = async (req, res) => {
 };
 
 // ════════════════════════════════════════════════════════════════
-// ✅ NEW DEDICATED ENDPOINT: GET ONLY ADMIN-POSTED JOBS
+// ✅ DEDICATED ENDPOINT: GET ONLY ADMIN-POSTED JOBS
 // Called via GET /api/v1/jobs/admin-posted
 // ════════════════════════════════════════════════════════════════
 exports.getAdminPostedJobs = async (req, res) => {
@@ -289,8 +417,8 @@ exports.getAdminPostedJobs = async (req, res) => {
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 200));
     const skip = (page - 1) * limit;
 
-    // STRICT FILTER: only admin-posted jobs, excludes any recruiter jobs
-    const filter = { postedBy: "admin" };
+    // STRICT SMART FILTER: catches all admin-posted jobs
+    const filter = buildAdminFilter();
 
     if (req.query.status && req.query.status !== "All" && req.query.status !== "") {
       filter.status = req.query.status;
@@ -300,12 +428,14 @@ exports.getAdminPostedJobs = async (req, res) => {
     }
     if (req.query.search && req.query.search.trim()) {
       const s = req.query.search.trim();
-      filter.$or = [
+      const searchOr = [
         { title: { $regex: s, $options: "i" } },
         { companyName: { $regex: s, $options: "i" } },
         { "location.city": { $regex: s, $options: "i" } },
         { "location.state": { $regex: s, $options: "i" } }
       ];
+      filter.$and = [{ $or: filter.$or }, { $or: searchOr }];
+      delete filter.$or;
     }
 
     const [rawJobs, totalCount] = await Promise.all([
@@ -356,11 +486,12 @@ exports.getAdminPostedJobs = async (req, res) => {
       })
     );
 
+    const adminFilter = buildAdminFilter();
     const [total, live, pending, rejected] = await Promise.all([
-      Job.countDocuments({ postedBy: "admin" }),
-      Job.countDocuments({ postedBy: "admin", status: "Live" }),
-      Job.countDocuments({ postedBy: "admin", approvalStatus: "pending_review" }),
-      Job.countDocuments({ postedBy: "admin", approvalStatus: "rejected" })
+      Job.countDocuments(adminFilter),
+      Job.countDocuments({ ...adminFilter, status: "Live" }),
+      Job.countDocuments({ ...adminFilter, approvalStatus: "pending_review" }),
+      Job.countDocuments({ ...adminFilter, approvalStatus: "rejected" })
     ]);
 
     return res.status(200).json({
@@ -379,6 +510,63 @@ exports.getAdminPostedJobs = async (req, res) => {
     });
   } catch (error) {
     console.error("getAdminPostedJobs Error:", error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ════════════════════════════════════════════════════════════════
+// ✅ ONE-TIME MIGRATION ENDPOINT: Backfill postedBy field
+// Call: GET /api/v1/jobs/migrate-posted-by
+// Automatically tags all old jobs as admin or recruiter based on heuristics
+// ════════════════════════════════════════════════════════════════
+exports.migratePostedBy = async (req, res) => {
+  try {
+    const allJobs = await Job.find({}).lean();
+    let adminCount = 0;
+    let recruiterCount = 0;
+    let updatedCount = 0;
+
+    for (const j of allJobs) {
+      const isAdmin = detectIsAdminPosted(j);
+      const newPostedBy = isAdmin ? "admin" : "recruiter";
+      const newPostedByRole = j.postedByRole || (isAdmin ? "Super Admin" : "Recruiter");
+      const newPostedByName = j.postedByName || (isAdmin ? "Smile Jobs" : (j.contactPerson?.name || "Recruiter"));
+      const newPostedByEmail = j.postedByEmail || (isAdmin ? "smilejobs@gmail.com" : (j.recruiterEmail || ""));
+
+      if (
+        j.postedBy !== newPostedBy ||
+        j.postedByRole !== newPostedByRole ||
+        j.postedByName !== newPostedByName ||
+        j.postedByEmail !== newPostedByEmail
+      ) {
+        await Job.updateOne(
+          { _id: j._id },
+          {
+            $set: {
+              postedBy: newPostedBy,
+              postedByRole: newPostedByRole,
+              postedByName: newPostedByName,
+              postedByEmail: newPostedByEmail
+            }
+          }
+        );
+        updatedCount++;
+      }
+
+      if (isAdmin) adminCount++;
+      else recruiterCount++;
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Migration complete",
+      totalJobs: allJobs.length,
+      updatedCount,
+      adminCount,
+      recruiterCount
+    });
+  } catch (error) {
+    console.error("migratePostedBy Error:", error);
     return res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -462,6 +650,13 @@ exports.createJob = async (req, res) => {
 
     const now = new Date();
 
+    // ✅ Determine if poster is admin based on auth context
+    const posterIsAdmin = isAnyAdmin(req, user);
+    const resolvedPostedBy = body.postedBy || (posterIsAdmin ? "admin" : "recruiter");
+    const resolvedPostedByName = user.name || user.fullName || body.postedByName || (posterIsAdmin ? "Smile Jobs" : "");
+    const resolvedPostedByEmail = user.email || body.postedByEmail || (posterIsAdmin ? "smilejobs@gmail.com" : "");
+    const resolvedPostedByRole = user.role || body.postedByRole || (posterIsAdmin ? "Super Admin" : "Recruiter");
+
     // Exact Target Schema Payload Generation
     const jobData = {
       title: body.title || "",
@@ -533,11 +728,11 @@ exports.createJob = async (req, res) => {
       featured: Boolean(body.featured),
       isNew: true,
       isCompanyVerified: Boolean(body.isCompanyVerified),
-      postedBy: body.postedBy || "admin",
+      postedBy: resolvedPostedBy,
       postedByUserId: String(user._id || user.id || body.postedByUserId || rId),
-      postedByName: user.name || user.fullName || body.postedByName || "Smile Jobs",
-      postedByEmail: user.email || body.postedByEmail || "smilejobs@gmail.com",
-      postedByRole: user.role || body.postedByRole || "Super Admin",
+      postedByName: resolvedPostedByName,
+      postedByEmail: resolvedPostedByEmail,
+      postedByRole: resolvedPostedByRole,
       approvalStatus: "approved",
       submittedForReviewAt: now,
       approvedAt: now,
@@ -708,16 +903,18 @@ exports.updateContactVisibility = async (req, res) => {
 // 12. DB STATISTICS
 exports.getJobStats = async (req, res) => {
   try {
-    const [total, live, pending, rejected] = await Promise.all([
+    const [total, live, pending, rejected, adminPosted, recruiterPosted] = await Promise.all([
       Job.countDocuments({}),
       Job.countDocuments({ status: "Live" }),
       Job.countDocuments({ approvalStatus: "pending_review" }),
-      Job.countDocuments({ approvalStatus: "rejected" })
+      Job.countDocuments({ approvalStatus: "rejected" }),
+      Job.countDocuments(buildAdminFilter()),
+      Job.countDocuments(buildRecruiterFilter())
     ]);
 
     return res.status(200).json({
       success: true,
-      stats: { total, live, pending, rejected }
+      stats: { total, live, pending, rejected, adminPosted, recruiterPosted }
     });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
