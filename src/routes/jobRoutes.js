@@ -13,16 +13,20 @@ const {
   toggleFeature,
   toggleStatus,
   updateContactVisibility,
-  getAdminPostedJobs, // ✅ NEW
+  getAdminPostedJobs,
+  exportJobs, // ✅ NEW
+  migratePostedBy, // ✅ exposed
 } = require("../controllers/jobController");
 const { protect } = require("../middleware/authMiddleware");
 const upload = require("../utils/uploadMiddleware");
 
-// Public routes (candidate app reads these)
+// Public routes
 router.get("/", getJobs);
 
-// ✅ IMPORTANT: Place this BEFORE /:id to avoid route conflict
+// ✅ IMPORTANT: Place BEFORE /:id to avoid route conflict
 router.get("/admin-posted", getAdminPostedJobs);
+router.get("/export", exportJobs); // ✅ NEW — CSV export (public read, authenticated fetch via headers)
+router.get("/migrate-posted-by", migratePostedBy); // One-time migration
 
 router.get("/:id", getJobById);
 
@@ -49,7 +53,7 @@ router.put(
 
 router.delete("/:id", protect, deleteJob);
 
-// Admin approval routes (Accepts both POST & PATCH to prevent front-end errors)
+// Admin approval routes
 router.post("/:id/approve", protect, approveJob);
 router.patch("/:id/approve", protect, approveJob);
 
