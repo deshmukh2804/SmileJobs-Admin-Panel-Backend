@@ -17,6 +17,9 @@ const AVAILABLE_PERMISSIONS = [
   "roles-and-permissions",
   "platform-settings",
   "admin-activity-log",
+  // ✅ NEW: Candidate Profile Pricing & Payment Dashboard permissions
+  "candidate-profile-pricing",
+  "payment-dashboard",
 ];
 
 const roleSchema = new mongoose.Schema(
