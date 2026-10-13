@@ -10,6 +10,7 @@ const {
   getApplicationsByUser,
   bulkUpdateStatus,
   exportApplications,
+  viewResume,
 } = require("../controllers/applicationController");
 const { authenticateAny } = require("../middleware/roleMiddleware");
 
@@ -43,3 +44,11 @@ router.patch("/:id/status", updateApplicationStatus);
 router.delete("/:id", deleteApplication);
 
 module.exports = router;
+
+// ═══════════════════════════════════════════════════════════════
+// RESUME VIEW ROUTE — Exported separately for mounting at
+// /api/profile/resume in app.js (no auth required for direct links)
+// ═══════════════════════════════════════════════════════════════
+const resumeRouter = express.Router();
+resumeRouter.get("/view/:userId", viewResume);
+module.exports.resumeRouter = resumeRouter;

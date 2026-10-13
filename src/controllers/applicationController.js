@@ -1,9 +1,11 @@
 // FILE: backend/src/controllers/applicationController.js
-const Application = require("../models/Application");
+const Application = require("../models/application");
 const Job = require("../models/Job");
 const Recruiter = require("../models/Recruiter");
 const User = require("../models/User");
 const mongoose = require("mongoose");
+const https = require("https");
+const http = require("http");
 
 // ═══════════════════════════════════════════════════════════════
 // TENANT ISOLATION HELPERS (MAPPED TO MULTI-DB PATTERN)
@@ -1076,6 +1078,121 @@ const exportApplications = async (req, res) => {
   }
 };
 
+// ═══════════════════════════════════════════════════════════════
+// @desc    Proxy resume PDF from Cloudinary via userId
+// @route   GET /api/profile/resume/view/:userId
+// @access  Public (direct link access for resume viewing)
+// ═══════════════════════════════════════════════════════════════
+const viewResume = async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        message: "User ID is required",
+      });
+    }
+
+    // Find the most recent application for this user that has a resume URL
+    const application = await Application.findOne({ userId })
+      .sort({ appliedAt: -1 })
+      .select("resumeUrl resumeFileName candidateName")
+      .lean();
+
+    if (!application || !application.resumeUrl) {
+      return res.status(404).json({
+        success: false,
+        message: "Resume not found for this user",
+      });
+    }
+
+    const resumeUrl = application.resumeUrl;
+
+    // Determine HTTP client based on URL protocol
+    const client = resumeUrl.startsWith("https") ? https : http;
+
+    // Fetch the PDF from Cloudinary (or wherever it's stored) and stream it
+    const request = client.get(resumeUrl, (response) => {
+      // Handle redirects (3xx)
+      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        const redirectClient = response.headers.location.startsWith("https") ? https : http;
+        redirectClient.get(response.headers.location, (redirectResponse) => {
+          if (redirectResponse.statusCode !== 200) {
+            return res.status(redirectResponse.statusCode).json({
+              success: false,
+              message: "Failed to fetch resume from storage after redirect",
+            });
+          }
+
+          const fileName =
+            application.resumeFileName ||
+            `${application.candidateName || "resume"}_resume.pdf`;
+
+          res.setHeader("Content-Type", "application/pdf");
+          res.setHeader("Content-Disposition", `inline; filename="${fileName}"`);
+          res.setHeader("Cache-Control", "public, max-age=86400");
+          res.setHeader("X-Content-Type-Options", "nosniff");
+
+          redirectResponse.pipe(res);
+        }).on("error", (err) => {
+          console.error("Resume redirect proxy error:", err.message);
+          if (!res.headersSent) {
+            res.status(500).json({ success: false, message: "Error streaming resume" });
+          }
+        });
+        return;
+      }
+
+      if (response.statusCode !== 200) {
+        return res.status(response.statusCode).json({
+          success: false,
+          message: "Failed to fetch resume from storage",
+        });
+      }
+
+      const fileName =
+        application.resumeFileName ||
+        `${application.candidateName || "resume"}_resume.pdf`;
+
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `inline; filename="${fileName}"`);
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+
+      response.pipe(res);
+    });
+
+    request.on("error", (err) => {
+      console.error("Resume proxy error:", err.message);
+      if (!res.headersSent) {
+        res.status(500).json({
+          success: false,
+          message: "Error streaming resume",
+        });
+      }
+    });
+
+    request.setTimeout(15000, () => {
+      request.destroy();
+      if (!res.headersSent) {
+        res.status(504).json({
+          success: false,
+          message: "Resume fetch timed out",
+        });
+      }
+    });
+  } catch (error) {
+    console.error("View Resume Error:", error.message);
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        message: "Server error while fetching resume",
+      });
+    }
+  }
+};
+
 module.exports = {
   getApplications,
   getApplicationById,
@@ -1085,4 +1202,5 @@ module.exports = {
   getApplicationsByUser,
   bulkUpdateStatus,
   exportApplications,
+  viewResume,
 };
