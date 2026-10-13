@@ -82,7 +82,7 @@ const applyRecruiterScope = async (filter, authUser, requestedJobId = null) => {
 const APPLICATION_SERVICE_BASE_URL =
   process.env.APPLICATION_SERVICE_URL ||
   process.env.APPLICATION_BACKEND_URL ||
-  "https://smilejobs-application-backend.onrender.com";
+  "https://admin-api.smilejobs.in";
 
 const buildResumeProxyUrl = (userId) => {
   if (!userId) return "";
