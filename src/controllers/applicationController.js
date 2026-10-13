@@ -1,5 +1,5 @@
 // FILE: backend/src/controllers/applicationController.js
-const Application = require("../models/Application");
+const Application = require("../models/application");
 const Job = require("../models/Job");
 const Recruiter = require("../models/Recruiter");
 const User = require("../models/User");
@@ -29,12 +29,8 @@ try {
 
 // ═══════════════════════════════════════════════════════════════
 // TENANT ISOLATION HELPERS (MAPPED TO MULTI-DB PATTERN)
-// Ensures recruiters cannot read/write other company applications.
 // ═══════════════════════════════════════════════════════════════
 
-/**
- * Fetch all job ObjectIds owned by the recruiter from the Job_db database.
- */
 const getRecruiterJobIds = async (recruiterId) => {
   if (!recruiterId) return [];
   let recObjectId;
@@ -47,16 +43,11 @@ const getRecruiterJobIds = async (recruiterId) => {
   return jobs.map((j) => j._id);
 };
 
-/**
- * Apply dynamic scope to query filters depending on the authenticated user's role.
- * Admins retain global access; recruiters are scoped strictly to their owned jobs.
- */
 const applyRecruiterScope = async (filter, authUser, requestedJobId = null) => {
   if (!authUser) {
     throw new Error("Authentication verification failed: User payload missing");
   }
 
-  // Admin access bypass
   if (authUser.role !== "recruiter") {
     if (requestedJobId) {
       let reqJobObjectId;
@@ -66,14 +57,13 @@ const applyRecruiterScope = async (filter, authUser, requestedJobId = null) => {
     return true;
   }
 
-  // Recruiter restriction path
   const ownedJobIds = await getRecruiterJobIds(authUser.id);
   const ownedJobIdsStr = ownedJobIds.map((id) => id.toString());
 
   if (requestedJobId) {
     const requestedJobIdStr = requestedJobId.toString();
     if (!ownedJobIdsStr.includes(requestedJobIdStr)) {
-      return false; // Unauthorized access attempt detected
+      return false;
     }
     let reqJobObjectId;
     try { reqJobObjectId = new mongoose.Types.ObjectId(requestedJobIdStr); } catch (e) { reqJobObjectId = null; }
@@ -81,7 +71,7 @@ const applyRecruiterScope = async (filter, authUser, requestedJobId = null) => {
   } else if (filter.jobId) {
     const existingJobIdStr = filter.jobId.toString();
     if (!ownedJobIdsStr.includes(existingJobIdStr)) {
-      return false; // Unauthorized access attempt detected
+      return false;
     }
     let extJobObjectId;
     try { extJobObjectId = new mongoose.Types.ObjectId(existingJobIdStr); } catch (e) { extJobObjectId = null; }
@@ -98,14 +88,8 @@ const applyRecruiterScope = async (filter, authUser, requestedJobId = null) => {
 
 // ═══════════════════════════════════════════════════════════════
 // RESUME PROXY URL BUILDER (ADMIN BACKEND SELF-HOSTED)
-// Transforms raw Cloudinary resume URLs into proxy URLs served
-// directly from this admin backend (admin-api.smilejobs.in)
 // ═══════════════════════════════════════════════════════════════
 
-/**
- * Build the base URL of the admin backend itself.
- * Priority: ENV override → request-derived host.
- */
 const getAdminBackendBaseUrl = (req) => {
   if (process.env.ADMIN_BACKEND_URL) {
     return process.env.ADMIN_BACKEND_URL.replace(/\/+$/, "");
@@ -121,18 +105,12 @@ const getAdminBackendBaseUrl = (req) => {
   return "https://admin-api.smilejobs.in";
 };
 
-/**
- * Build a proxy URL that goes through THIS admin backend to stream the resume.
- */
 const buildResumeProxyUrl = (userId, req) => {
   if (!userId) return "";
   const base = getAdminBackendBaseUrl(req);
   return `${base}/api/v1/applications/resume/view/${userId}`;
 };
 
-/**
- * Build a download proxy URL for the resume.
- */
 const buildResumeDownloadUrl = (userId, req) => {
   if (!userId) return "";
   const base = getAdminBackendBaseUrl(req);
@@ -140,8 +118,116 @@ const buildResumeDownloadUrl = (userId, req) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
+// 🆕 CLOUDINARY URL PARSER & SIGNED URL GENERATOR
+// Extracts public_id from any Cloudinary URL and generates
+// signed URLs that bypass ACL restrictions.
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Extract public_id and resource_type from a Cloudinary URL.
+ * Example URL: https://res.cloudinary.com/mqyjz7hl/image/upload/v1789652311/careerflow/resumes/resume_xxx.pdf
+ * Returns: { publicId: "careerflow/resumes/resume_xxx", resourceType: "image", format: "pdf" }
+ */
+const parseCloudinaryUrl = (url) => {
+  if (!url || typeof url !== "string") return null;
+  if (!url.includes("res.cloudinary.com")) return null;
+
+  try {
+    // Pattern: .../cloudinary.com/{cloud}/{resource_type}/upload/{version?}/{public_id}.{format}
+    const match = url.match(
+      /res\.cloudinary\.com\/([^/]+)\/(image|raw|video|auto)\/upload\/(?:v\d+\/)?(.+?)(?:\.([a-zA-Z0-9]+))?$/
+    );
+    if (!match) return null;
+
+    const cloudName = match[1];
+    const resourceType = match[2];
+    let publicId = match[3];
+    const format = match[4] || "";
+
+    // Remove file extension from public_id if present
+    if (format && publicId.endsWith(`.${format}`)) {
+      publicId = publicId.slice(0, -(format.length + 1));
+    }
+
+    return { cloudName, resourceType, publicId, format };
+  } catch (e) {
+    return null;
+  }
+};
+
+/**
+ * Generate multiple signed URL candidates from a Cloudinary URL or public_id.
+ * This handles ACL-restricted files by signing with the API secret.
+ */
+const generateSignedUrlCandidates = (url, publicId) => {
+  const candidates = [];
+  if (!cloudinary) return candidates;
+
+  const parsed = url ? parseCloudinaryUrl(url) : null;
+  const pid = publicId || (parsed ? parsed.publicId : null);
+
+  if (!pid) return candidates;
+
+  // Determine resource types to try (the file might be stored as 'image' or 'raw')
+  const resourceTypesToTry = new Set();
+  if (parsed) resourceTypesToTry.add(parsed.resourceType);
+  resourceTypesToTry.add("raw");
+  resourceTypesToTry.add("image");
+  resourceTypesToTry.add("auto");
+
+  for (const rt of resourceTypesToTry) {
+    // 1. Signed URL (bypasses ACL for authenticated delivery)
+    try {
+      const signedUrl = cloudinary.url(pid, {
+        resource_type: rt,
+        type: "upload",
+        sign_url: true,
+        secure: true,
+      });
+      if (signedUrl && !candidates.includes(signedUrl)) {
+        candidates.push(signedUrl);
+      }
+    } catch (e) {
+      // skip
+    }
+
+    // 2. Private download URL (works for private/authenticated access mode)
+    try {
+      if (typeof cloudinary.utils?.private_download_url === "function") {
+        const privateUrl = cloudinary.utils.private_download_url(pid, "", {
+          resource_type: rt,
+          type: "upload",
+          expires_at: Math.floor(Date.now() / 1000) + 7200,
+        });
+        if (privateUrl && !candidates.includes(privateUrl)) {
+          candidates.push(privateUrl);
+        }
+      }
+    } catch (e) {
+      // skip
+    }
+
+    // 3. Authenticated type URL (for access_mode: 'authenticated' uploads)
+    try {
+      const authUrl = cloudinary.url(pid, {
+        resource_type: rt,
+        type: "authenticated",
+        sign_url: true,
+        secure: true,
+      });
+      if (authUrl && !candidates.includes(authUrl)) {
+        candidates.push(authUrl);
+      }
+    } catch (e) {
+      // skip
+    }
+  }
+
+  return candidates;
+};
+
+// ═══════════════════════════════════════════════════════════════
 // SEQUENTIAL STATUS WORKFLOW DEFINITION
-// Enforces step-by-step progression - no skipping stages
 // ═══════════════════════════════════════════════════════════════
 const STATUS_WORKFLOW = {
   Applied: ["Viewed", "Rejected", "Withdrawn"],
@@ -149,9 +235,9 @@ const STATUS_WORKFLOW = {
   Shortlisted: ["Interview", "Rejected", "Withdrawn"],
   Interview: ["Offered", "Rejected", "Withdrawn"],
   Offered: ["Hired", "Rejected", "Withdrawn"],
-  Hired: [], // Terminal state
-  Rejected: [], // Terminal state
-  Withdrawn: [], // Terminal state
+  Hired: [],
+  Rejected: [],
+  Withdrawn: [],
 };
 
 const STATUS_ORDER = [
@@ -181,12 +267,11 @@ const isValidTransition = (currentStatus, newStatus) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// CSV HELPER — escapes a value for safe CSV output
+// CSV HELPER
 // ═══════════════════════════════════════════════════════════════
 const csvEscape = (val) => {
   if (val === null || val === undefined) return "";
   let str = typeof val === "string" ? val : String(val);
-  // Strip newlines/tabs that corrupt CSV rows
   str = str.replace(/\r?\n|\r/g, " ").replace(/\t/g, " ");
   if (str.includes(",") || str.includes('"') || str.includes("'")) {
     str = `"${str.replace(/"/g, '""')}"`;
@@ -195,8 +280,7 @@ const csvEscape = (val) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// ENRICHMENT HELPER: Attach recruiter + user info to applications
-// Also transforms resume URLs to use the admin backend's own proxy
+// ENRICHMENT HELPER
 // ═══════════════════════════════════════════════════════════════
 const enrichApplications = async (applications, req = null) => {
   if (!applications || applications.length === 0) return [];
@@ -216,7 +300,6 @@ const enrichApplications = async (applications, req = null) => {
     ),
   ];
 
-  // Fetch jobs (with recruiter info)
   let jobsMap = {};
   let recruitersMap = {};
   try {
@@ -261,7 +344,6 @@ const enrichApplications = async (applications, req = null) => {
     console.error("Enrichment - Jobs/Recruiters lookup failed:", e.message);
   }
 
-  // Fetch users (candidates) — ALSO fetch resumeUrl, resumePublicId, resumeFileName
   let usersMap = {};
   try {
     if (userIds.length > 0) {
@@ -281,7 +363,6 @@ const enrichApplications = async (applications, req = null) => {
     console.error("Enrichment - Users lookup failed:", e.message);
   }
 
-  // Attach enriched data
   return applications.map((app) => {
     const appObj = app.toObject ? app.toObject() : app;
     const jobIdStr = appObj.jobId?.toString();
@@ -292,18 +373,14 @@ const enrichApplications = async (applications, req = null) => {
     const recruiterData = recruiterId ? recruitersMap[recruiterId] : null;
     const userData = userIdStr ? usersMap[userIdStr] : null;
 
-    // Compute allowed next statuses for this application
     const currentStatus = appObj.status || "Applied";
     const allowedNextStatuses = STATUS_WORKFLOW[currentStatus] || [];
 
-    // 🔧 RESUME URL TRANSFORMATION
-    // Build a proxy URL served by THIS admin backend that streams the PDF.
     const originalResumeUrl =
       appObj.resumeUrl ||
       userData?.resumeUrl ||
       "";
 
-    // Only build proxy if we have EITHER a raw URL OR a public ID on the user doc
     const hasResume = !!(originalResumeUrl || userData?.resumePublicId);
     const proxyResumeUrl = userIdStr && hasResume ? buildResumeProxyUrl(userIdStr, req) : "";
     const downloadResumeUrl = userIdStr && hasResume ? buildResumeDownloadUrl(userIdStr, req) : "";
@@ -386,7 +463,6 @@ const getApplications = async (req, res) => {
 
     const filter = {};
 
-    // 🛡️ Apply Secure Recruiter Scoping (Tenant Isolation)
     const isAuthorized = await applyRecruiterScope(filter, authUser, jobId);
     if (!isAuthorized) {
       return res.status(200).json({
@@ -447,7 +523,6 @@ const getApplications = async (req, res) => {
       Application.countDocuments(filter),
     ]);
 
-    // Enrich matched applications with nested entities (pass req for proxy URL building)
     const enriched = await enrichApplications(applications, req);
 
     const counts = {
@@ -510,7 +585,6 @@ const getApplicationById = async (req, res) => {
       });
     }
 
-    // 🛡️ Tenant isolation authorization check
     if (authUser.role === "recruiter") {
       const ownedJobIds = await getRecruiterJobIds(authUser.id);
       const ownedJobIdsStr = ownedJobIds.map((id) => id.toString());
@@ -568,7 +642,6 @@ const updateApplicationStatus = async (req, res) => {
       });
     }
 
-    // 🛡️ Tenant isolation authorization check
     if (authUser.role === "recruiter") {
       const ownedJobIds = await getRecruiterJobIds(authUser.id);
       const ownedJobIdsStr = ownedJobIds.map((id) => id.toString());
@@ -640,7 +713,6 @@ const deleteApplication = async (req, res) => {
       });
     }
 
-    // 🛡️ Tenant isolation authorization check
     if (authUser.role === "recruiter") {
       const ownedJobIds = await getRecruiterJobIds(authUser.id);
       const ownedJobIdsStr = ownedJobIds.map((id) => id.toString());
@@ -680,7 +752,6 @@ const getApplicationsByJob = async (req, res) => {
 
     const jobIdsArray = [jobId, jobObjectId].filter(Boolean);
 
-    // 🛡️ Tenant isolation authorization check
     if (authUser.role === "recruiter") {
       const ownedJobIds = await getRecruiterJobIds(authUser.id);
       const ownedJobIdsStr = ownedJobIds.map((id) => id.toString());
@@ -740,7 +811,6 @@ const getApplicationsByUser = async (req, res) => {
     const userIdsArray = [userId, userObjectId].filter(Boolean);
     const filter = { userId: { $in: userIdsArray } };
 
-    // 🛡️ Filter scope verification for candidates viewed by recruiters
     const isAuthorized = await applyRecruiterScope(filter, authUser);
     if (!isAuthorized) {
       return res.status(200).json({
@@ -817,7 +887,6 @@ const bulkUpdateStatus = async (req, res) => {
       });
     }
 
-    // 🛡️ Tenant isolation: Only select applications mapped to recruiter's jobs
     const query = { _id: { $in: ids } };
     if (authUser.role === "recruiter") {
       const ownedJobIds = await getRecruiterJobIds(authUser.id);
@@ -841,7 +910,6 @@ const bulkUpdateStatus = async (req, res) => {
       }
     }
 
-    // Capture unauthorized or invalid IDs supplied in the batch
     const retrievedIdsStr = applications.map((app) => app._id.toString());
     ids.forEach((inputId) => {
       if (!retrievedIdsStr.includes(inputId.toString())) {
@@ -891,9 +959,68 @@ const bulkUpdateStatus = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
+// 🆕 INTERNAL HELPER: Fetch PDF buffer from Cloudinary
+// Tries signed URLs, private URLs, authenticated URLs, and raw URLs.
+// Handles ACL-restricted files properly.
+// ═══════════════════════════════════════════════════════════════
+const fetchPdfBufferFromCloudinary = async (resumeUrl, resumePublicId) => {
+  const candidateUrls = [];
+
+  // 1. Generate signed URLs from public_id (HIGHEST PRIORITY - bypasses ACL)
+  if (resumePublicId) {
+    const signedCandidates = generateSignedUrlCandidates(null, resumePublicId);
+    candidateUrls.push(...signedCandidates);
+  }
+
+  // 2. Generate signed URLs by parsing the raw Cloudinary URL
+  if (resumeUrl && resumeUrl.includes("res.cloudinary.com")) {
+    const signedFromUrl = generateSignedUrlCandidates(resumeUrl, null);
+    for (const u of signedFromUrl) {
+      if (!candidateUrls.includes(u)) candidateUrls.push(u);
+    }
+  }
+
+  // 3. Add the raw URL as last resort (will fail if ACL restricted, but try anyway)
+  if (resumeUrl) {
+    if (!candidateUrls.includes(resumeUrl)) candidateUrls.push(resumeUrl);
+    if (resumeUrl.includes("/image/upload/")) {
+      const rawVariant = resumeUrl.replace("/image/upload/", "/raw/upload/");
+      if (!candidateUrls.includes(rawVariant)) candidateUrls.push(rawVariant);
+    }
+  }
+
+  console.log(`[fetchPdf] Trying ${candidateUrls.length} URL candidates...`);
+
+  for (let i = 0; i < candidateUrls.length; i++) {
+    const url = candidateUrls[i];
+    try {
+      const fetchRes = await fetch(url);
+      if (fetchRes.ok) {
+        const ab = await fetchRes.arrayBuffer();
+        const buf = Buffer.from(ab);
+        // Validate: PDF starts with %PDF or at least is a substantial file
+        const isPdf = buf.slice(0, 4).toString() === "%PDF";
+        const isSubstantial = buf.length > 500;
+        if (isPdf || isSubstantial) {
+          console.log(`[fetchPdf] ✅ Success on candidate #${i + 1}: ${url.slice(0, 100)}...`);
+          return buf;
+        }
+        console.warn(`[fetchPdf] ⚠️ Candidate #${i + 1} returned ${buf.length} bytes (too small or not PDF)`);
+      } else {
+        console.warn(`[fetchPdf] ❌ Candidate #${i + 1} HTTP ${fetchRes.status}: ${url.slice(0, 100)}...`);
+      }
+    } catch (e) {
+      console.warn(`[fetchPdf] ❌ Candidate #${i + 1} fetch error: ${e.message}`);
+    }
+  }
+
+  return null;
+};
+
+// ═══════════════════════════════════════════════════════════════
 // 🆕 @desc    View resume PDF (stream from Cloudinary via admin backend)
 // @route   GET /api/v1/applications/resume/view/:userId
-// Public endpoint - streams PDF directly to browser for inline viewing.
+// ⚠️ THIS ROUTE MUST BE PUBLIC (NO AUTH MIDDLEWARE)
 // ═══════════════════════════════════════════════════════════════
 const viewResume = async (req, res) => {
   try {
@@ -905,89 +1032,67 @@ const viewResume = async (req, res) => {
       });
     }
 
+    // Fetch user with ALL resume-related fields
     const user = await User.findById(userId).select(
       "resumeUrl resumeFileName resumePublicId"
-    );
+    ).lean();
 
     if (!user || (!user.resumeUrl && !user.resumePublicId)) {
-      return res.status(404).json({
-        success: false,
-        message: "Resume not found for this user",
-      });
-    }
-
-    // Build list of candidate URLs to try, in priority order
-    const candidateUrls = [];
-
-    // Try Cloudinary signed URLs first (works for private/authenticated uploads)
-    if (cloudinary && user.resumePublicId) {
+      // Also check if any Application for this user has a resume URL
+      let appResumeUrl = null;
+      let appResumePublicId = null;
       try {
-        if (cloudinary.utils && typeof cloudinary.utils.private_download_url === "function") {
-          const privateUrl = cloudinary.utils.private_download_url(
-            user.resumePublicId,
-            "",
-            {
-              resource_type: "raw",
-              type: "upload",
-              expires_at: Math.floor(Date.now() / 1000) + 7200,
-            }
-          );
-          if (privateUrl) candidateUrls.push(privateUrl);
+        let userObjectId;
+        try { userObjectId = new mongoose.Types.ObjectId(userId); } catch (e) { userObjectId = null; }
+        const userIdsArray = [userId, userObjectId].filter(Boolean);
+        
+        const appWithResume = await Application.findOne({
+          userId: { $in: userIdsArray },
+          $or: [
+            { resumeUrl: { $exists: true, $ne: "" } },
+            { resumePublicId: { $exists: true, $ne: "" } }
+          ]
+        }).select("resumeUrl resumePublicId resumeFileName").lean();
+
+        if (appWithResume) {
+          appResumeUrl = appWithResume.resumeUrl;
+          appResumePublicId = appWithResume.resumePublicId;
         }
       } catch (e) {
-        console.warn("[viewResume] private_download_url failed:", e.message);
+        console.warn("[viewResume] Application fallback lookup failed:", e.message);
       }
 
-      try {
-        if (typeof cloudinary.url === "function") {
-          const signedUrl = cloudinary.url(user.resumePublicId, {
-            resource_type: "raw",
-            type: "upload",
-            sign_url: true,
-            secure: true,
-          });
-          if (signedUrl && !candidateUrls.includes(signedUrl)) {
-            candidateUrls.push(signedUrl);
-          }
-        }
-      } catch (e) {
-        console.warn("[viewResume] signed URL build failed:", e.message);
+      if (!appResumeUrl && !appResumePublicId) {
+        return res.status(404).json({
+          success: false,
+          message: "Resume not found for this user",
+        });
       }
+
+      // Use application-level resume data
+      const pdfBuffer = await fetchPdfBufferFromCloudinary(appResumeUrl, appResumePublicId);
+      if (!pdfBuffer) {
+        return res.status(404).json({
+          success: false,
+          message: "Unable to retrieve resume PDF from storage.",
+          code: "RESUME_FETCH_FAILED",
+        });
+      }
+
+      const fileName = "Resume.pdf";
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `inline; filename="${fileName}"`);
+      res.setHeader("Content-Length", pdfBuffer.length);
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      return res.status(200).send(pdfBuffer);
     }
 
-    // Fall back to the raw stored URL
-    if (user.resumeUrl) {
-      candidateUrls.push(user.resumeUrl);
-      // Also try swapping image→raw delivery path (common Cloudinary issue)
-      if (user.resumeUrl.includes("/image/upload/")) {
-        candidateUrls.push(user.resumeUrl.replace("/image/upload/", "/raw/upload/"));
-      }
-    }
+    // User has resume data — fetch and stream
+    const pdfBuffer = await fetchPdfBufferFromCloudinary(user.resumeUrl, user.resumePublicId);
 
-    // Try each candidate URL and grab the first one that returns a valid PDF
-    let pdfBuffer = null;
-    let fetchedSuccessfully = false;
-
-    for (const url of candidateUrls) {
-      try {
-        const fetchRes = await fetch(url);
-        if (fetchRes.ok) {
-          const ab = await fetchRes.arrayBuffer();
-          const buf = Buffer.from(ab);
-          // Validate it looks like a PDF or at least a non-trivial file
-          if (buf.length > 100) {
-            pdfBuffer = buf;
-            fetchedSuccessfully = true;
-            console.log(`[viewResume] ✅ Streamed resume from: ${url.slice(0, 80)}...`);
-            break;
-          }
-        }
-      } catch (e) {
-        console.warn(`[viewResume] Failed fetching: ${url.slice(0, 80)}...`, e.message);
-      }
-    }
-
-    if (!fetchedSuccessfully || !pdfBuffer) {
+    if (!pdfBuffer) {
       return res.status(404).json({
         success: false,
         message: "Unable to retrieve resume PDF from storage.",
@@ -1023,6 +1128,7 @@ const viewResume = async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // 🆕 @desc    Download resume PDF (force download attachment)
 // @route   GET /api/v1/applications/resume/download/:userId
+// ⚠️ THIS ROUTE MUST BE PUBLIC (NO AUTH MIDDLEWARE)
 // ═══════════════════════════════════════════════════════════════
 const downloadResume = async (req, res) => {
   try {
@@ -1036,52 +1142,45 @@ const downloadResume = async (req, res) => {
 
     const user = await User.findById(userId).select(
       "resumeUrl resumeFileName resumePublicId"
-    );
+    ).lean();
 
-    if (!user || (!user.resumeUrl && !user.resumePublicId)) {
+    let resumeUrl = user?.resumeUrl || "";
+    let resumePublicId = user?.resumePublicId || "";
+    let resumeFileName = user?.resumeFileName || "Resume.pdf";
+
+    // Fallback to Application-level resume if User doc doesn't have it
+    if (!resumeUrl && !resumePublicId) {
+      try {
+        let userObjectId;
+        try { userObjectId = new mongoose.Types.ObjectId(userId); } catch (e) { userObjectId = null; }
+        const userIdsArray = [userId, userObjectId].filter(Boolean);
+        
+        const appWithResume = await Application.findOne({
+          userId: { $in: userIdsArray },
+          $or: [
+            { resumeUrl: { $exists: true, $ne: "" } },
+            { resumePublicId: { $exists: true, $ne: "" } }
+          ]
+        }).select("resumeUrl resumePublicId resumeFileName").lean();
+
+        if (appWithResume) {
+          resumeUrl = appWithResume.resumeUrl || resumeUrl;
+          resumePublicId = appWithResume.resumePublicId || resumePublicId;
+          resumeFileName = appWithResume.resumeFileName || resumeFileName;
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    if (!resumeUrl && !resumePublicId) {
       return res.status(404).json({
         success: false,
         message: "Resume not found",
       });
     }
 
-    const candidateUrls = [];
-
-    if (cloudinary && user.resumePublicId) {
-      try {
-        if (cloudinary.utils && typeof cloudinary.utils.private_download_url === "function") {
-          const privateUrl = cloudinary.utils.private_download_url(
-            user.resumePublicId,
-            "",
-            {
-              resource_type: "raw",
-              type: "upload",
-              expires_at: Math.floor(Date.now() / 1000) + 7200,
-            }
-          );
-          if (privateUrl) candidateUrls.push(privateUrl);
-        }
-      } catch (_) {}
-    }
-
-    if (user.resumeUrl) {
-      candidateUrls.push(user.resumeUrl);
-      if (user.resumeUrl.includes("/image/upload/")) {
-        candidateUrls.push(user.resumeUrl.replace("/image/upload/", "/raw/upload/"));
-      }
-    }
-
-    let pdfBuffer = null;
-    for (const url of candidateUrls) {
-      try {
-        const fetchRes = await fetch(url);
-        if (fetchRes.ok) {
-          const ab = await fetchRes.arrayBuffer();
-          pdfBuffer = Buffer.from(ab);
-          if (pdfBuffer.length > 100) break;
-        }
-      } catch (_) {}
-    }
+    const pdfBuffer = await fetchPdfBufferFromCloudinary(resumeUrl, resumePublicId);
 
     if (!pdfBuffer) {
       return res.status(404).json({
@@ -1090,10 +1189,7 @@ const downloadResume = async (req, res) => {
       });
     }
 
-    const fileName = (user.resumeFileName || "Resume.pdf").replace(
-      /[^a-zA-Z0-9._-]/g,
-      "_"
-    );
+    const fileName = resumeFileName.replace(/[^a-zA-Z0-9._-]/g, "_");
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
@@ -1126,14 +1222,13 @@ const exportApplications = async (req, res) => {
       matchMin,
       matchMax,
       city,
-      ids, // comma-separated list for "export selected"
+      ids,
       sortBy = "appliedAt",
       sortOrder = "desc",
     } = req.query;
 
     const filter = {};
 
-    // 🛡️ Apply Secure Recruiter Scoping (Tenant Isolation)
     const isAuthorized = await applyRecruiterScope(filter, authUser, jobId);
     if (!isAuthorized) {
       return res.status(403).json({
@@ -1142,7 +1237,6 @@ const exportApplications = async (req, res) => {
       });
     }
 
-    // Filter by selected IDs if provided
     if (ids && typeof ids === "string") {
       const idArray = ids.split(",").map(s => s.trim()).filter(Boolean);
       if (idArray.length > 0) {
@@ -1161,7 +1255,6 @@ const exportApplications = async (req, res) => {
         { jobTitle: { $regex: search, $options: "i" } },
         { jobCompany: { $regex: search, $options: "i" } },
       ];
-      // Merge safely with any existing $or (e.g. from scope)
       if (filter.$or) {
         filter.$and = filter.$and || [];
         filter.$and.push({ $or: filter.$or });
@@ -1191,22 +1284,18 @@ const exportApplications = async (req, res) => {
 
     const sortObj = { [sortBy]: sortOrder === "asc" ? 1 : -1 };
 
-    // Hard cap at 10,000 rows for safety
     const applications = await Application.find(filter)
       .sort(sortObj)
       .limit(10000);
 
-    // Enrich with recruiter + user info
     const enriched = await enrichApplications(applications, req);
 
-    // ═══════════ BUILD CSV ═══════════
     const headers = [
       "Application ID",
       "Applied At",
       "Status",
       "Category",
       "Match %",
-      // Candidate
       "Candidate Name",
       "Candidate Email",
       "Candidate Phone",
@@ -1222,15 +1311,12 @@ const exportApplications = async (req, res) => {
       "Candidate Languages",
       "Candidate Assets",
       "Candidate Certifications",
-      // Education
       "Education Degree",
       "Education Specialization",
       "Education College",
       "Education End Year",
-      // Account
       "Account Active",
       "Account Member Since",
-      // Job
       "Job ID",
       "Job Title",
       "Job Company",
@@ -1238,7 +1324,6 @@ const exportApplications = async (req, res) => {
       "Job Salary",
       "Job Type",
       "Job Work Mode",
-      // Recruiter
       "Recruiter ID",
       "Recruiter Name",
       "Recruiter Email",
@@ -1247,12 +1332,10 @@ const exportApplications = async (req, res) => {
       "Recruiter Designation",
       "Recruiter Company",
       "Recruiter Verified",
-      // Job HR (fallback)
       "Job HR Name",
       "Job HR Role",
       "Job HR Phone",
       "Job HR WhatsApp",
-      // Other
       "Cover Note",
       "HR Notes",
       "Resume URL",
@@ -1274,7 +1357,6 @@ const exportApplications = async (req, res) => {
         app.status,
         app.category,
         app.matchPercentage,
-
         app.candidateName,
         app.candidateEmail,
         app.candidatePhone,
@@ -1290,15 +1372,12 @@ const exportApplications = async (req, res) => {
         Array.isArray(app.candidateLanguages) ? app.candidateLanguages.join(" | ") : "",
         Array.isArray(app.candidateAssets) ? app.candidateAssets.join(" | ") : "",
         Array.isArray(app.candidateCertifications) ? app.candidateCertifications.join(" | ") : "",
-
         edu.degree,
         edu.specialization,
         edu.collegeName,
         edu.endYear,
-
         acc.isActive === true ? "Yes" : acc.isActive === false ? "No" : "",
         acc.memberSince ? new Date(acc.memberSince).toISOString() : "",
-
         app.jobId,
         app.jobTitle,
         app.jobCompany,
@@ -1306,7 +1385,6 @@ const exportApplications = async (req, res) => {
         app.jobSalary,
         job.jobType,
         job.workMode,
-
         rec.id || "",
         rec.name || "",
         rec.email || "",
@@ -1315,12 +1393,10 @@ const exportApplications = async (req, res) => {
         rec.designation || "",
         rec.companyName || "",
         rec.verified ? "Yes" : "No",
-
         app.jobHrName,
         app.jobHrRole,
         app.jobHrPhone,
         app.jobHrWhatsapp,
-
         app.coverNote,
         app.hrNotes,
         app.resumeUrl,
@@ -1331,11 +1407,9 @@ const exportApplications = async (req, res) => {
       ].map(csvEscape).join(",");
     });
 
-    // UTF-8 BOM for Excel compatibility
     const BOM = "\uFEFF";
     const csv = BOM + headers.map(csvEscape).join(",") + "\n" + rows.join("\n");
 
-    // Dynamic filename
     const dateStr = new Date().toISOString().slice(0, 10);
     let suffix = "_all";
     if (status && status !== "all") suffix = `_${String(status).toLowerCase()}`;
@@ -1364,6 +1438,6 @@ module.exports = {
   getApplicationsByUser,
   bulkUpdateStatus,
   exportApplications,
-  viewResume,       // 🆕 NEW
-  downloadResume,   // 🆕 NEW
+  viewResume,
+  downloadResume,
 };
