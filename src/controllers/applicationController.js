@@ -1,5 +1,5 @@
 // FILE: backend/src/controllers/applicationController.js
-const Application = require("../models/application");
+const Application = require("../models/Application");
 const Job = require("../models/Job");
 const Recruiter = require("../models/Recruiter");
 const User = require("../models/User");
@@ -118,22 +118,16 @@ const buildResumeDownloadUrl = (userId, req) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// 🆕 CLOUDINARY URL PARSER & SIGNED URL GENERATOR
+// CLOUDINARY URL PARSER & SIGNED URL GENERATOR
 // Extracts public_id from any Cloudinary URL and generates
 // signed URLs that bypass ACL restrictions.
 // ═══════════════════════════════════════════════════════════════
 
-/**
- * Extract public_id and resource_type from a Cloudinary URL.
- * Example URL: https://res.cloudinary.com/mqyjz7hl/image/upload/v1789652311/careerflow/resumes/resume_xxx.pdf
- * Returns: { publicId: "careerflow/resumes/resume_xxx", resourceType: "image", format: "pdf" }
- */
 const parseCloudinaryUrl = (url) => {
   if (!url || typeof url !== "string") return null;
   if (!url.includes("res.cloudinary.com")) return null;
 
   try {
-    // Pattern: .../cloudinary.com/{cloud}/{resource_type}/upload/{version?}/{public_id}.{format}
     const match = url.match(
       /res\.cloudinary\.com\/([^/]+)\/(image|raw|video|auto)\/upload\/(?:v\d+\/)?(.+?)(?:\.([a-zA-Z0-9]+))?$/
     );
@@ -144,7 +138,6 @@ const parseCloudinaryUrl = (url) => {
     let publicId = match[3];
     const format = match[4] || "";
 
-    // Remove file extension from public_id if present
     if (format && publicId.endsWith(`.${format}`)) {
       publicId = publicId.slice(0, -(format.length + 1));
     }
@@ -155,10 +148,6 @@ const parseCloudinaryUrl = (url) => {
   }
 };
 
-/**
- * Generate multiple signed URL candidates from a Cloudinary URL or public_id.
- * This handles ACL-restricted files by signing with the API secret.
- */
 const generateSignedUrlCandidates = (url, publicId) => {
   const candidates = [];
   if (!cloudinary) return candidates;
@@ -168,7 +157,6 @@ const generateSignedUrlCandidates = (url, publicId) => {
 
   if (!pid) return candidates;
 
-  // Determine resource types to try (the file might be stored as 'image' or 'raw')
   const resourceTypesToTry = new Set();
   if (parsed) resourceTypesToTry.add(parsed.resourceType);
   resourceTypesToTry.add("raw");
@@ -176,7 +164,6 @@ const generateSignedUrlCandidates = (url, publicId) => {
   resourceTypesToTry.add("auto");
 
   for (const rt of resourceTypesToTry) {
-    // 1. Signed URL (bypasses ACL for authenticated delivery)
     try {
       const signedUrl = cloudinary.url(pid, {
         resource_type: rt,
@@ -187,11 +174,8 @@ const generateSignedUrlCandidates = (url, publicId) => {
       if (signedUrl && !candidates.includes(signedUrl)) {
         candidates.push(signedUrl);
       }
-    } catch (e) {
-      // skip
-    }
+    } catch (e) {}
 
-    // 2. Private download URL (works for private/authenticated access mode)
     try {
       if (typeof cloudinary.utils?.private_download_url === "function") {
         const privateUrl = cloudinary.utils.private_download_url(pid, "", {
@@ -203,11 +187,8 @@ const generateSignedUrlCandidates = (url, publicId) => {
           candidates.push(privateUrl);
         }
       }
-    } catch (e) {
-      // skip
-    }
+    } catch (e) {}
 
-    // 3. Authenticated type URL (for access_mode: 'authenticated' uploads)
     try {
       const authUrl = cloudinary.url(pid, {
         resource_type: rt,
@@ -218,9 +199,7 @@ const generateSignedUrlCandidates = (url, publicId) => {
       if (authUrl && !candidates.includes(authUrl)) {
         candidates.push(authUrl);
       }
-    } catch (e) {
-      // skip
-    }
+    } catch (e) {}
   }
 
   return candidates;
@@ -959,7 +938,7 @@ const bulkUpdateStatus = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// 🆕 INTERNAL HELPER: Fetch PDF buffer from Cloudinary
+// INTERNAL HELPER: Fetch PDF buffer from Cloudinary
 // Tries signed URLs, private URLs, authenticated URLs, and raw URLs.
 // Handles ACL-restricted files properly.
 // ═══════════════════════════════════════════════════════════════
@@ -998,7 +977,6 @@ const fetchPdfBufferFromCloudinary = async (resumeUrl, resumePublicId) => {
       if (fetchRes.ok) {
         const ab = await fetchRes.arrayBuffer();
         const buf = Buffer.from(ab);
-        // Validate: PDF starts with %PDF or at least is a substantial file
         const isPdf = buf.slice(0, 4).toString() === "%PDF";
         const isSubstantial = buf.length > 500;
         if (isPdf || isSubstantial) {
@@ -1018,9 +996,8 @@ const fetchPdfBufferFromCloudinary = async (resumeUrl, resumePublicId) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// 🆕 @desc    View resume PDF (stream from Cloudinary via admin backend)
+// @desc    View resume PDF (stream from Cloudinary via admin backend)
 // @route   GET /api/v1/applications/resume/view/:userId
-// ⚠️ THIS ROUTE MUST BE PUBLIC (NO AUTH MIDDLEWARE)
 // ═══════════════════════════════════════════════════════════════
 const viewResume = async (req, res) => {
   try {
@@ -1032,13 +1009,11 @@ const viewResume = async (req, res) => {
       });
     }
 
-    // Fetch user with ALL resume-related fields
     const user = await User.findById(userId).select(
       "resumeUrl resumeFileName resumePublicId"
     ).lean();
 
     if (!user || (!user.resumeUrl && !user.resumePublicId)) {
-      // Also check if any Application for this user has a resume URL
       let appResumeUrl = null;
       let appResumePublicId = null;
       try {
@@ -1069,7 +1044,6 @@ const viewResume = async (req, res) => {
         });
       }
 
-      // Use application-level resume data
       const pdfBuffer = await fetchPdfBufferFromCloudinary(appResumeUrl, appResumePublicId);
       if (!pdfBuffer) {
         return res.status(404).json({
@@ -1089,7 +1063,6 @@ const viewResume = async (req, res) => {
       return res.status(200).send(pdfBuffer);
     }
 
-    // User has resume data — fetch and stream
     const pdfBuffer = await fetchPdfBufferFromCloudinary(user.resumeUrl, user.resumePublicId);
 
     if (!pdfBuffer) {
@@ -1126,9 +1099,8 @@ const viewResume = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// 🆕 @desc    Download resume PDF (force download attachment)
+// @desc    Download resume PDF (force download attachment)
 // @route   GET /api/v1/applications/resume/download/:userId
-// ⚠️ THIS ROUTE MUST BE PUBLIC (NO AUTH MIDDLEWARE)
 // ═══════════════════════════════════════════════════════════════
 const downloadResume = async (req, res) => {
   try {
@@ -1148,7 +1120,6 @@ const downloadResume = async (req, res) => {
     let resumePublicId = user?.resumePublicId || "";
     let resumeFileName = user?.resumeFileName || "Resume.pdf";
 
-    // Fallback to Application-level resume if User doc doesn't have it
     if (!resumeUrl && !resumePublicId) {
       try {
         let userObjectId;
@@ -1168,9 +1139,7 @@ const downloadResume = async (req, res) => {
           resumePublicId = appWithResume.resumePublicId || resumePublicId;
           resumeFileName = appWithResume.resumeFileName || resumeFileName;
         }
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) {}
     }
 
     if (!resumeUrl && !resumePublicId) {
