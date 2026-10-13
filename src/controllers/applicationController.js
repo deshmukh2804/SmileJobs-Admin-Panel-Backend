@@ -6,6 +6,28 @@ const User = require("../models/User");
 const mongoose = require("mongoose");
 
 // ═══════════════════════════════════════════════════════════════
+// CLOUDINARY SETUP (for direct resume streaming from admin backend)
+// ═══════════════════════════════════════════════════════════════
+let cloudinary = null;
+try {
+  cloudinary = require("../config/cloudinary");
+} catch (e) {
+  try {
+    cloudinary = require("cloudinary").v2;
+    if (process.env.CLOUDINARY_CLOUD_NAME) {
+      cloudinary.config({
+        cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+        api_key: process.env.CLOUDINARY_API_KEY,
+        api_secret: process.env.CLOUDINARY_API_SECRET,
+        secure: true,
+      });
+    }
+  } catch (err) {
+    console.warn("⚠️ Cloudinary not configured in admin backend. Resume streaming will fall back to raw URLs.");
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // TENANT ISOLATION HELPERS (MAPPED TO MULTI-DB PATTERN)
 // Ensures recruiters cannot read/write other company applications.
 // ═══════════════════════════════════════════════════════════════
@@ -75,19 +97,46 @@ const applyRecruiterScope = async (filter, authUser, requestedJobId = null) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// RESUME PROXY URL BUILDER
-// Transforms raw Cloudinary resume URLs into proper proxy URLs
-// that stream validated PDF buffers with correct headers.
+// RESUME PROXY URL BUILDER (ADMIN BACKEND SELF-HOSTED)
+// Transforms raw Cloudinary resume URLs into proxy URLs served
+// directly from this admin backend (admin-api.smilejobs.in)
 // ═══════════════════════════════════════════════════════════════
-const APPLICATION_SERVICE_BASE_URL =
-  process.env.APPLICATION_SERVICE_URL ||
-  process.env.APPLICATION_BACKEND_URL ||
-  "https://smilejobs-application-backend.onrender.com";
 
-const buildResumeProxyUrl = (userId) => {
+/**
+ * Build the base URL of the admin backend itself.
+ * Priority: ENV override → request-derived host.
+ */
+const getAdminBackendBaseUrl = (req) => {
+  if (process.env.ADMIN_BACKEND_URL) {
+    return process.env.ADMIN_BACKEND_URL.replace(/\/+$/, "");
+  }
+  if (process.env.BACKEND_URL) {
+    return process.env.BACKEND_URL.replace(/\/+$/, "");
+  }
+  if (req) {
+    const protocol = req.get("x-forwarded-proto") || req.protocol || "https";
+    const host = req.get("host") || "admin-api.smilejobs.in";
+    return `${protocol}://${host}`;
+  }
+  return "https://admin-api.smilejobs.in";
+};
+
+/**
+ * Build a proxy URL that goes through THIS admin backend to stream the resume.
+ */
+const buildResumeProxyUrl = (userId, req) => {
   if (!userId) return "";
-  const base = APPLICATION_SERVICE_BASE_URL.replace(/\/+$/, "");
-  return `${base}/api/profile/resume/view/${userId}`;
+  const base = getAdminBackendBaseUrl(req);
+  return `${base}/api/v1/applications/resume/view/${userId}`;
+};
+
+/**
+ * Build a download proxy URL for the resume.
+ */
+const buildResumeDownloadUrl = (userId, req) => {
+  if (!userId) return "";
+  const base = getAdminBackendBaseUrl(req);
+  return `${base}/api/v1/applications/resume/download/${userId}`;
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -147,9 +196,9 @@ const csvEscape = (val) => {
 
 // ═══════════════════════════════════════════════════════════════
 // ENRICHMENT HELPER: Attach recruiter + user info to applications
-// Also transforms resume URLs to use the proxy endpoint
+// Also transforms resume URLs to use the admin backend's own proxy
 // ═══════════════════════════════════════════════════════════════
-const enrichApplications = async (applications) => {
+const enrichApplications = async (applications, req = null) => {
   if (!applications || applications.length === 0) return [];
 
   const jobIds = [
@@ -212,7 +261,7 @@ const enrichApplications = async (applications) => {
     console.error("Enrichment - Jobs/Recruiters lookup failed:", e.message);
   }
 
-  // Fetch users (candidates)
+  // Fetch users (candidates) — ALSO fetch resumeUrl, resumePublicId, resumeFileName
   let usersMap = {};
   try {
     if (userIds.length > 0) {
@@ -221,7 +270,7 @@ const enrichApplications = async (applications) => {
       }).filter(Boolean);
 
       const users = await User.find({ _id: { $in: [...uObjectIds, ...userIds] } })
-        .select("name email phone isActive createdAt")
+        .select("name email phone isActive createdAt resumeUrl resumePublicId resumeFileName")
         .lean();
 
       users.forEach((u) => {
@@ -248,15 +297,23 @@ const enrichApplications = async (applications) => {
     const allowedNextStatuses = STATUS_WORKFLOW[currentStatus] || [];
 
     // 🔧 RESUME URL TRANSFORMATION
-    // Replace raw Cloudinary URL with the mobile app backend's
-    // proxy endpoint that streams a validated PDF buffer.
-    const originalResumeUrl = appObj.resumeUrl || "";
-    const proxyResumeUrl = userIdStr ? buildResumeProxyUrl(userIdStr) : "";
+    // Build a proxy URL served by THIS admin backend that streams the PDF.
+    const originalResumeUrl =
+      appObj.resumeUrl ||
+      userData?.resumeUrl ||
+      "";
+
+    // Only build proxy if we have EITHER a raw URL OR a public ID on the user doc
+    const hasResume = !!(originalResumeUrl || userData?.resumePublicId);
+    const proxyResumeUrl = userIdStr && hasResume ? buildResumeProxyUrl(userIdStr, req) : "";
+    const downloadResumeUrl = userIdStr && hasResume ? buildResumeDownloadUrl(userIdStr, req) : "";
 
     return {
       ...appObj,
       resumeUrl: proxyResumeUrl || originalResumeUrl,
       resumeOriginalUrl: originalResumeUrl,
+      resumeDownloadUrl: downloadResumeUrl,
+      resumeFileName: appObj.resumeFileName || userData?.resumeFileName || "Resume.pdf",
       recruiter: recruiterData
         ? {
             id: recruiterData._id,
@@ -390,8 +447,8 @@ const getApplications = async (req, res) => {
       Application.countDocuments(filter),
     ]);
 
-    // Enrich matched applications with nested entities
-    const enriched = await enrichApplications(applications);
+    // Enrich matched applications with nested entities (pass req for proxy URL building)
+    const enriched = await enrichApplications(applications, req);
 
     const counts = {
       applied: 0,
@@ -465,7 +522,7 @@ const getApplicationById = async (req, res) => {
       }
     }
 
-    const enriched = await enrichApplications([application]);
+    const enriched = await enrichApplications([application], req);
 
     res.status(200).json({
       success: true,
@@ -554,7 +611,7 @@ const updateApplicationStatus = async (req, res) => {
 
     await application.save();
 
-    const enriched = await enrichApplications([application]);
+    const enriched = await enrichApplications([application], req);
 
     res.status(200).json({
       success: true,
@@ -648,7 +705,7 @@ const getApplicationsByJob = async (req, res) => {
       Application.countDocuments(filter),
     ]);
 
-    const enriched = await enrichApplications(applications);
+    const enriched = await enrichApplications(applications, req);
 
     res.status(200).json({
       success: true,
@@ -710,7 +767,7 @@ const getApplicationsByUser = async (req, res) => {
       Application.countDocuments(filter),
     ]);
 
-    const enriched = await enrichApplications(applications);
+    const enriched = await enrichApplications(applications, req);
 
     res.status(200).json({
       success: true,
@@ -834,6 +891,226 @@ const bulkUpdateStatus = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
+// 🆕 @desc    View resume PDF (stream from Cloudinary via admin backend)
+// @route   GET /api/v1/applications/resume/view/:userId
+// Public endpoint - streams PDF directly to browser for inline viewing.
+// ═══════════════════════════════════════════════════════════════
+const viewResume = async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        message: "User ID is required",
+      });
+    }
+
+    const user = await User.findById(userId).select(
+      "resumeUrl resumeFileName resumePublicId"
+    );
+
+    if (!user || (!user.resumeUrl && !user.resumePublicId)) {
+      return res.status(404).json({
+        success: false,
+        message: "Resume not found for this user",
+      });
+    }
+
+    // Build list of candidate URLs to try, in priority order
+    const candidateUrls = [];
+
+    // Try Cloudinary signed URLs first (works for private/authenticated uploads)
+    if (cloudinary && user.resumePublicId) {
+      try {
+        if (cloudinary.utils && typeof cloudinary.utils.private_download_url === "function") {
+          const privateUrl = cloudinary.utils.private_download_url(
+            user.resumePublicId,
+            "",
+            {
+              resource_type: "raw",
+              type: "upload",
+              expires_at: Math.floor(Date.now() / 1000) + 7200,
+            }
+          );
+          if (privateUrl) candidateUrls.push(privateUrl);
+        }
+      } catch (e) {
+        console.warn("[viewResume] private_download_url failed:", e.message);
+      }
+
+      try {
+        if (typeof cloudinary.url === "function") {
+          const signedUrl = cloudinary.url(user.resumePublicId, {
+            resource_type: "raw",
+            type: "upload",
+            sign_url: true,
+            secure: true,
+          });
+          if (signedUrl && !candidateUrls.includes(signedUrl)) {
+            candidateUrls.push(signedUrl);
+          }
+        }
+      } catch (e) {
+        console.warn("[viewResume] signed URL build failed:", e.message);
+      }
+    }
+
+    // Fall back to the raw stored URL
+    if (user.resumeUrl) {
+      candidateUrls.push(user.resumeUrl);
+      // Also try swapping image→raw delivery path (common Cloudinary issue)
+      if (user.resumeUrl.includes("/image/upload/")) {
+        candidateUrls.push(user.resumeUrl.replace("/image/upload/", "/raw/upload/"));
+      }
+    }
+
+    // Try each candidate URL and grab the first one that returns a valid PDF
+    let pdfBuffer = null;
+    let fetchedSuccessfully = false;
+
+    for (const url of candidateUrls) {
+      try {
+        const fetchRes = await fetch(url);
+        if (fetchRes.ok) {
+          const ab = await fetchRes.arrayBuffer();
+          const buf = Buffer.from(ab);
+          // Validate it looks like a PDF or at least a non-trivial file
+          if (buf.length > 100) {
+            pdfBuffer = buf;
+            fetchedSuccessfully = true;
+            console.log(`[viewResume] ✅ Streamed resume from: ${url.slice(0, 80)}...`);
+            break;
+          }
+        }
+      } catch (e) {
+        console.warn(`[viewResume] Failed fetching: ${url.slice(0, 80)}...`, e.message);
+      }
+    }
+
+    if (!fetchedSuccessfully || !pdfBuffer) {
+      return res.status(404).json({
+        success: false,
+        message: "Unable to retrieve resume PDF from storage.",
+        code: "RESUME_FETCH_FAILED",
+      });
+    }
+
+    const fileName = (user.resumeFileName || "Resume.pdf").replace(
+      /[^a-zA-Z0-9._-]/g,
+      "_"
+    );
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${fileName}"`);
+    res.setHeader("Content-Length", pdfBuffer.length);
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+
+    return res.status(200).send(pdfBuffer);
+  } catch (error) {
+    console.error("[viewResume] error:", error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        message: error.message || "Error streaming resume",
+        code: "RESUME_VIEW_ERROR",
+      });
+    }
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════
+// 🆕 @desc    Download resume PDF (force download attachment)
+// @route   GET /api/v1/applications/resume/download/:userId
+// ═══════════════════════════════════════════════════════════════
+const downloadResume = async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        message: "User ID is required",
+      });
+    }
+
+    const user = await User.findById(userId).select(
+      "resumeUrl resumeFileName resumePublicId"
+    );
+
+    if (!user || (!user.resumeUrl && !user.resumePublicId)) {
+      return res.status(404).json({
+        success: false,
+        message: "Resume not found",
+      });
+    }
+
+    const candidateUrls = [];
+
+    if (cloudinary && user.resumePublicId) {
+      try {
+        if (cloudinary.utils && typeof cloudinary.utils.private_download_url === "function") {
+          const privateUrl = cloudinary.utils.private_download_url(
+            user.resumePublicId,
+            "",
+            {
+              resource_type: "raw",
+              type: "upload",
+              expires_at: Math.floor(Date.now() / 1000) + 7200,
+            }
+          );
+          if (privateUrl) candidateUrls.push(privateUrl);
+        }
+      } catch (_) {}
+    }
+
+    if (user.resumeUrl) {
+      candidateUrls.push(user.resumeUrl);
+      if (user.resumeUrl.includes("/image/upload/")) {
+        candidateUrls.push(user.resumeUrl.replace("/image/upload/", "/raw/upload/"));
+      }
+    }
+
+    let pdfBuffer = null;
+    for (const url of candidateUrls) {
+      try {
+        const fetchRes = await fetch(url);
+        if (fetchRes.ok) {
+          const ab = await fetchRes.arrayBuffer();
+          pdfBuffer = Buffer.from(ab);
+          if (pdfBuffer.length > 100) break;
+        }
+      } catch (_) {}
+    }
+
+    if (!pdfBuffer) {
+      return res.status(404).json({
+        success: false,
+        message: "Resume file not found",
+      });
+    }
+
+    const fileName = (user.resumeFileName || "Resume.pdf").replace(
+      /[^a-zA-Z0-9._-]/g,
+      "_"
+    );
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+    res.setHeader("Content-Length", pdfBuffer.length);
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
+    return res.status(200).send(pdfBuffer);
+  } catch (error) {
+    console.error("[downloadResume] error:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════
 // @desc    Export applications as CSV (respects filters + tenant isolation)
 // @route   GET /api/v1/applications/export
 // ═══════════════════════════════════════════════════════════════
@@ -920,7 +1197,7 @@ const exportApplications = async (req, res) => {
       .limit(10000);
 
     // Enrich with recruiter + user info
-    const enriched = await enrichApplications(applications);
+    const enriched = await enrichApplications(applications, req);
 
     // ═══════════ BUILD CSV ═══════════
     const headers = [
@@ -980,6 +1257,7 @@ const exportApplications = async (req, res) => {
       "HR Notes",
       "Resume URL",
       "Resume Original URL",
+      "Resume Download URL",
       "Resume File Name",
       "Created At",
     ];
@@ -1047,6 +1325,7 @@ const exportApplications = async (req, res) => {
         app.hrNotes,
         app.resumeUrl,
         app.resumeOriginalUrl,
+        app.resumeDownloadUrl,
         app.resumeFileName,
         app.createdAt ? new Date(app.createdAt).toISOString() : "",
       ].map(csvEscape).join(",");
@@ -1085,4 +1364,6 @@ module.exports = {
   getApplicationsByUser,
   bulkUpdateStatus,
   exportApplications,
+  viewResume,       // 🆕 NEW
+  downloadResume,   // 🆕 NEW
 };
