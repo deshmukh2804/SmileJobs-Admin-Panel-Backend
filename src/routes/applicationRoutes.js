@@ -10,29 +10,18 @@ const {
   getApplicationsByUser,
   bulkUpdateStatus,
   exportApplications,
-  viewResume,
-  downloadResume,
 } = require("../controllers/applicationController");
 const { authenticateAny } = require("../middleware/roleMiddleware");
 
-// ═══════════════════════════════════════════════════════════════
-// 🆕 PUBLIC ROUTES — NO AUTHENTICATION REQUIRED
-// Must be declared BEFORE `router.use(authenticateAny)`.
-// Browser <iframe>, <embed>, and direct links cannot send JWT headers,
-// so these endpoints stream the PDF directly.
-// ═══════════════════════════════════════════════════════════════
-router.get("/resume/view/:userId", viewResume);
-router.get("/resume/download/:userId", downloadResume);
-
-// ═══════════════════════════════════════════════════════════════
-// PROTECTED ROUTES (All routes below require Admin OR Recruiter JWT)
-// ═══════════════════════════════════════════════════════════════
+// All routes require authentication (admin OR recruiter)
+// ✅ FIX: Removed requireRecruiterOrAdmin — it was blocking admin panel tokens
+// authenticateAny already verifies the JWT is valid for any user type
 router.use(authenticateAny);
 
 // GET all applications
 router.get("/", getApplications);
 
-// ✅ Export applications as CSV (MUST be before /:id to avoid route conflict)
+// ✅ NEW: Export applications as CSV (MUST be before /:id to avoid route conflict)
 router.get("/export", exportApplications);
 
 // PATCH bulk update statuses
