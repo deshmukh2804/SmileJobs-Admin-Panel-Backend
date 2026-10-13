@@ -1,5 +1,5 @@
 // FILE: backend/src/controllers/applicationController.js
-const Application = require("../models/application");
+const Application = require("../models/Application");
 const Job = require("../models/Job");
 const Recruiter = require("../models/Recruiter");
 const User = require("../models/User");
