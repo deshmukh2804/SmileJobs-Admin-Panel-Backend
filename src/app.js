@@ -24,7 +24,7 @@ const applicationRoutes = require("./routes/applicationRoutes");
 const applicationHierarchyRoutes = require("./routes/applicationHierarchyRoutes");
 const dashboardRoutes = require("./routes/dashboardRoutes");
 
-// ✅ NEW: PRICING & PAYMENT DASHBOARD ROUTES
+// ✅ PRICING & PAYMENT DASHBOARD ROUTES
 const pricingRoutes = require("./routes/pricingRoutes");
 const paymentDashboardRoutes = require("./routes/paymentDashboardRoutes");
 
@@ -154,6 +154,13 @@ app.use("/api/v1/notifications", notificationRoutes);
 app.use("/api/v1/promotional-emails", promoEmailRoutes);
 app.use("/api/v1/user-management", userManagementRoutes);
 
+// ✅ PUBLIC RESUME VIEW PROXY ROUTES (No auth required to view inline PDF)
+if (applicationRoutes.resumeRouter) {
+  app.use("/api/profile/resume", applicationRoutes.resumeRouter);
+  app.use("/profile/resume", applicationRoutes.resumeRouter);
+  app.use("/api/v1/profile/resume", applicationRoutes.resumeRouter);
+}
+
 // Hierarchy endpoint mounts first to bypass general /:id routes
 app.use("/api/v1/applications/hierarchy", applicationHierarchyRoutes);
 app.use("/api/v1/applications", applicationRoutes);
@@ -161,7 +168,7 @@ app.use("/api/v1/applications", applicationRoutes);
 app.use("/api/v1/dashboard", dashboardRoutes);
 app.use("/api/v1/payments-and-billing", require("./routes/billingRoutes"));
 
-// ✅ NEW: PRICING & PAYMENT DASHBOARD MOUNTS
+// ✅ PRICING & PAYMENT DASHBOARD MOUNTS
 app.use("/api/v1/pricing", pricingRoutes);
 app.use("/api/v1/payment-dashboard", paymentDashboardRoutes);
 

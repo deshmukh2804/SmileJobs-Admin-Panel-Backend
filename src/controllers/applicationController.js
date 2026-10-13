@@ -4,8 +4,7 @@ const Job = require("../models/Job");
 const Recruiter = require("../models/Recruiter");
 const User = require("../models/User");
 const mongoose = require("mongoose");
-const https = require("https");
-const http = require("http");
+const { cloudinary } = require("../utils/cloudinary");
 
 // ═══════════════════════════════════════════════════════════════
 // TENANT ISOLATION HELPERS (MAPPED TO MULTI-DB PATTERN)
@@ -1082,112 +1081,117 @@ const exportApplications = async (req, res) => {
 // @desc    Proxy resume PDF from Cloudinary via userId
 // @route   GET /api/profile/resume/view/:userId
 // @access  Public (direct link access for resume viewing)
+// Logic mirrors mobile backend viewResume: fetch buffer from
+// multiple candidate URLs (signed Cloudinary → direct → raw fallback)
+// and stream validated PDF with correct headers.
 // ═══════════════════════════════════════════════════════════════
 const viewResume = async (req, res) => {
   try {
-    const { userId } = req.params;
-
+    const userId = req.params.userId;
     if (!userId) {
-      return res.status(400).json({
-        success: false,
-        message: "User ID is required",
-      });
+      return res.status(400).json({ success: false, message: "User ID is required" });
     }
 
-    // Find the most recent application for this user that has a resume URL
-    const application = await Application.findOne({ userId })
-      .sort({ appliedAt: -1 })
-      .select("resumeUrl resumeFileName candidateName")
-      .lean();
+    // Fetch user with resume fields
+    const user = await User.findById(userId).select("resumeUrl resumeFileName resumePublicId").lean();
 
-    if (!application || !application.resumeUrl) {
+    // Fallback: if the User model doesn't have resume fields, try finding resume from most recent application
+    let resumeUrl = user?.resumeUrl || "";
+    let resumeFileName = user?.resumeFileName || "";
+    let resumePublicId = user?.resumePublicId || "";
+
+    if (!resumeUrl && !resumePublicId) {
+      const application = await Application.findOne({ userId })
+        .sort({ appliedAt: -1 })
+        .select("resumeUrl resumeFileName candidateName")
+        .lean();
+
+      if (!application || !application.resumeUrl) {
+        return res.status(404).json({ success: false, message: "Resume not found" });
+      }
+
+      resumeUrl = application.resumeUrl;
+      resumeFileName = application.resumeFileName || `${application.candidateName || "resume"}_resume.pdf`;
+    }
+
+    // Build list of candidate URLs to try (prefer signed Cloudinary URLs if publicId exists)
+    const candidateUrls = [];
+
+    if (resumePublicId) {
+      try {
+        const privateUrl = cloudinary.utils.private_download_url(resumePublicId, "", {
+          resource_type: "raw",
+          type: "upload",
+          expires_at: Math.floor(Date.now() / 1000) + 7200,
+        });
+        if (privateUrl) candidateUrls.push(privateUrl);
+      } catch (_) {}
+
+      try {
+        const signedUrl = cloudinary.url(resumePublicId, {
+          resource_type: "raw",
+          type: "upload",
+          sign_url: true,
+          secure: true,
+        });
+        if (signedUrl && !candidateUrls.includes(signedUrl)) candidateUrls.push(signedUrl);
+      } catch (_) {}
+    }
+
+    if (resumeUrl) {
+      candidateUrls.push(resumeUrl);
+      if (resumeUrl.includes("/image/upload/")) {
+        candidateUrls.push(resumeUrl.replace("/image/upload/", "/raw/upload/"));
+      }
+    }
+
+    if (candidateUrls.length === 0) {
+      return res.status(404).json({ success: false, message: "Resume URL unavailable" });
+    }
+
+    // Try each candidate URL until a valid buffer is obtained
+    let pdfBuffer = null;
+    let fetchedSuccessfully = false;
+
+    for (const url of candidateUrls) {
+      try {
+        const fetchRes = await fetch(url);
+        if (fetchRes.ok) {
+          const ab = await fetchRes.arrayBuffer();
+          pdfBuffer = Buffer.from(ab);
+          if (pdfBuffer.slice(0, 4).toString() === "%PDF" || pdfBuffer.length > 100) {
+            fetchedSuccessfully = true;
+            break;
+          }
+        }
+      } catch (e) {
+        console.warn(`[viewResume] Failed fetching candidate URL: ${url}`, e.message);
+      }
+    }
+
+    if (!fetchedSuccessfully || !pdfBuffer) {
       return res.status(404).json({
         success: false,
-        message: "Resume not found for this user",
+        message: "Unable to retrieve resume PDF from storage.",
+        code: "RESUME_FETCH_FAILED",
       });
     }
 
-    const resumeUrl = application.resumeUrl;
+    const safeFileName = (resumeFileName || "Resume.pdf").replace(/[^a-zA-Z0-9._-]/g, "_");
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${safeFileName}"`);
+    res.setHeader("Content-Length", pdfBuffer.length);
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.setHeader("X-Content-Type-Options", "nosniff");
 
-    // Determine HTTP client based on URL protocol
-    const client = resumeUrl.startsWith("https") ? https : http;
-
-    // Fetch the PDF from Cloudinary (or wherever it's stored) and stream it
-    const request = client.get(resumeUrl, (response) => {
-      // Handle redirects (3xx)
-      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        const redirectClient = response.headers.location.startsWith("https") ? https : http;
-        redirectClient.get(response.headers.location, (redirectResponse) => {
-          if (redirectResponse.statusCode !== 200) {
-            return res.status(redirectResponse.statusCode).json({
-              success: false,
-              message: "Failed to fetch resume from storage after redirect",
-            });
-          }
-
-          const fileName =
-            application.resumeFileName ||
-            `${application.candidateName || "resume"}_resume.pdf`;
-
-          res.setHeader("Content-Type", "application/pdf");
-          res.setHeader("Content-Disposition", `inline; filename="${fileName}"`);
-          res.setHeader("Cache-Control", "public, max-age=86400");
-          res.setHeader("X-Content-Type-Options", "nosniff");
-
-          redirectResponse.pipe(res);
-        }).on("error", (err) => {
-          console.error("Resume redirect proxy error:", err.message);
-          if (!res.headersSent) {
-            res.status(500).json({ success: false, message: "Error streaming resume" });
-          }
-        });
-        return;
-      }
-
-      if (response.statusCode !== 200) {
-        return res.status(response.statusCode).json({
-          success: false,
-          message: "Failed to fetch resume from storage",
-        });
-      }
-
-      const fileName =
-        application.resumeFileName ||
-        `${application.candidateName || "resume"}_resume.pdf`;
-
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", `inline; filename="${fileName}"`);
-      res.setHeader("Cache-Control", "public, max-age=86400");
-      res.setHeader("X-Content-Type-Options", "nosniff");
-
-      response.pipe(res);
-    });
-
-    request.on("error", (err) => {
-      console.error("Resume proxy error:", err.message);
-      if (!res.headersSent) {
-        res.status(500).json({
-          success: false,
-          message: "Error streaming resume",
-        });
-      }
-    });
-
-    request.setTimeout(15000, () => {
-      request.destroy();
-      if (!res.headersSent) {
-        res.status(504).json({
-          success: false,
-          message: "Resume fetch timed out",
-        });
-      }
-    });
+    return res.status(200).send(pdfBuffer);
   } catch (error) {
-    console.error("View Resume Error:", error.message);
+    console.error("[viewResume] error:", error);
     if (!res.headersSent) {
       res.status(500).json({
         success: false,
-        message: "Server error while fetching resume",
+        message: error.message || "Error streaming resume",
+        code: "RESUME_VIEW_ERROR",
       });
     }
   }

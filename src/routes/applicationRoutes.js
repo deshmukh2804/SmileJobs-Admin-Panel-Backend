@@ -46,8 +46,9 @@ router.delete("/:id", deleteApplication);
 module.exports = router;
 
 // ═══════════════════════════════════════════════════════════════
-// RESUME VIEW ROUTE — Exported separately for mounting at
-// /api/profile/resume in app.js (no auth required for direct links)
+// RESUME VIEW ROUTER — Exported separately for mounting at
+// /api/profile/resume in app.js (NO AUTH — public access for direct links)
+// Mirrors the mobile backend's /api/profile/resume/view/:userId endpoint
 // ═══════════════════════════════════════════════════════════════
 const resumeRouter = express.Router();
 resumeRouter.get("/view/:userId", viewResume);
